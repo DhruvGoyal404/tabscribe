@@ -18,7 +18,7 @@ import {
   type Message,
   type Reply,
 } from '../shared/messages';
-import { mutedChange } from './tab-sync';
+import { badgeRefresh, badgeUpdates, mutedChange } from './tab-sync';
 
 const OFFSCREEN_PATH = 'src/offscreen/index.html';
 const BADGE_COLOR = '#1f5ed6';
@@ -29,15 +29,21 @@ async function readState(): Promise<CaptureState> {
 }
 
 async function dispatch(event: CaptureEvent): Promise<CaptureState> {
-  const next = transition(await readState(), event);
+  const previous = await readState();
+  const next = transition(previous, event);
   await chrome.storage.session.set({ [STATE_KEY]: next });
-  if (next.status === 'capturing') {
-    await chrome.action.setBadgeBackgroundColor({ color: BADGE_COLOR });
-    await chrome.action.setBadgeText({ text: 'ON' });
-  } else {
-    await chrome.action.setBadgeText({ text: '' });
-  }
+  for (const { tabId, text } of badgeUpdates(previous, next)) await setBadge(tabId, text);
   return next;
+}
+
+/** Per-tab badge. Chrome resets it when the tab closes, so a closed tab's failure is ignored. */
+async function setBadge(tabId: number, text: string): Promise<void> {
+  try {
+    if (text) await chrome.action.setBadgeBackgroundColor({ tabId, color: BADGE_COLOR });
+    await chrome.action.setBadgeText({ tabId, text });
+  } catch (error) {
+    console.debug('[tabscribe] badge not updated for tab', tabId, error);
+  }
 }
 
 // Run capture operations one at a time so double clicks and overlapping triggers can't interleave.
@@ -82,17 +88,12 @@ async function sendToOffscreen(message: Message): Promise<void> {
 }
 
 async function teardown(): Promise<void> {
-  try {
-    if (await hasOffscreenDocument()) {
-      // Stop tracks and close the AudioContext explicitly before the document goes away.
-      await sendToOffscreen({ type: 'offscreen/stop' }).catch((error: unknown) => {
-        console.warn('[tabscribe] offscreen stop failed', error);
-      });
-      await chrome.offscreen.closeDocument();
-    }
-  } finally {
-    await chrome.action.setBadgeText({ text: '' });
-  }
+  if (!(await hasOffscreenDocument())) return;
+  // Stop tracks and close the AudioContext explicitly before the document goes away.
+  await sendToOffscreen({ type: 'offscreen/stop' }).catch((error: unknown) => {
+    console.warn('[tabscribe] offscreen stop failed', error);
+  });
+  await chrome.offscreen.closeDocument();
 }
 
 // --- Capture lifecycle --------------------------------------------------------------------------
@@ -172,12 +173,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, change) => {
-  if (!change.mutedInfo) return;
+  if (!change.mutedInfo && change.status === undefined) return;
   void serialize(async () => {
-    const muted = mutedChange(await readState(), tabId, change);
+    const state = await readState();
+    const badge = badgeRefresh(state, tabId, change);
+    if (badge) await setBadge(badge.tabId, badge.text);
+    const muted = mutedChange(state, tabId, change);
     if (muted !== undefined) await sendToOffscreen({ type: 'offscreen/set-muted', muted });
   }).catch((error: unknown) => {
-    console.warn('[tabscribe] could not follow the tab mute state', error);
+    console.warn('[tabscribe] could not sync the captured tab', error);
   });
 });
 
