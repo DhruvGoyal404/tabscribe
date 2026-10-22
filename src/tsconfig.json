@@ -4,5 +4,6 @@
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "types": ["chrome", "vite/client"]
   },
-  "include": ["**/*.ts"]
+  "include": ["**/*.ts"],
+  "exclude": ["worklet/**"]
 }
