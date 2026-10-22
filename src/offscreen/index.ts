@@ -11,10 +11,12 @@ import {
   type Message,
   type Reply,
 } from '../shared/messages';
+import { passthroughGain, rampPassthrough } from './passthrough';
 
 interface Session {
   stream: MediaStream;
   context: AudioContext;
+  passthrough: GainNode;
 }
 
 let session: Session | null = null;
@@ -27,7 +29,7 @@ function tabAudioConstraints(streamId: string): MediaTrackConstraints {
   } as unknown as MediaTrackConstraints;
 }
 
-async function start(streamId: string): Promise<void> {
+async function start(streamId: string, muted: boolean): Promise<void> {
   await stop();
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: tabAudioConstraints(streamId),
@@ -36,12 +38,15 @@ async function start(streamId: string): Promise<void> {
   // Native sample rate on purpose: the passthrough below must not be resampled to 16 kHz.
   // Downsampling for speech recognition belongs inside the pipeline (Phase 3).
   const context = new AudioContext();
-  session = { stream, context };
+  // Capturing a tab stops it playing to the user, so we route it back out ourselves. Muting the
+  // tab no longer silences that playback, so the passthrough follows the tab's mute state. The
+  // meter taps the source before this gain: levels (and later captions) keep flowing while muted.
+  const passthrough = new GainNode(context, { gain: passthroughGain(muted) });
+  session = { stream, context, passthrough };
   try {
     await context.audioWorklet.addModule(workletUrl);
     const source = context.createMediaStreamSource(stream);
-    // Capturing a tab stops it playing to the user; route it back out at unity gain.
-    source.connect(context.destination);
+    source.connect(passthrough).connect(context.destination);
 
     const meter = new AudioWorkletNode(context, LEVEL_METER_PROCESSOR);
     meter.port.onmessage = (event: MessageEvent<unknown>) => {
@@ -69,6 +74,11 @@ async function stop(): Promise<void> {
     track.stop();
   }
   await current.context.close();
+}
+
+function setMuted(muted: boolean): void {
+  if (!session) return;
+  rampPassthrough(session.passthrough.gain, muted, session.context.currentTime);
 }
 
 function onTrackEnded(): void {
@@ -107,8 +117,12 @@ chrome.runtime.onMessage.addListener(
     if (sender.id !== chrome.runtime.id || !isMessage(message)) return false;
     switch (message.type) {
       case 'offscreen/start':
-        void settle(start(message.streamId)).then(sendResponse);
+        void settle(start(message.streamId, message.muted)).then(sendResponse);
         return true;
+      case 'offscreen/set-muted':
+        setMuted(message.muted);
+        sendResponse({ ok: true });
+        return false;
       case 'offscreen/stop':
         void settle(stop()).then(sendResponse);
         return true;
