@@ -1,0 +1,53 @@
+body {
+  width: 280px;
+}
+
+.status {
+  margin-bottom: 12px;
+}
+
+.meter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+meter {
+  flex: 1;
+  height: 14px;
+}
+
+.level {
+  min-width: 7ch;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--muted);
+}
+
+.level.clipped {
+  color: #d1242f;
+  font-weight: 600;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.actions button {
+  flex: 1;
+  padding: 6px 0;
+  font: inherit;
+}
+
+.error {
+  margin-top: 12px;
+  color: #d1242f;
+  word-break: break-word;
+}
+
+.version {
+  margin-top: 12px;
+  font-size: 0.8rem;
+}
