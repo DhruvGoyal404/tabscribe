@@ -56,6 +56,14 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Official Playwright image with the browsers and their system packages preinstalled, so the
+    # job skips the apt install. The tag must match @playwright/test exactly (a mismatch fails with
+    # a missing browser executable); bump both together. Pinned by digest.
+    # --user 1001 matches the runner's uid so the workspace and tool cache stay writable;
+    # --ipc=host and --init follow https://playwright.dev/docs/docker.
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
+      options: --user 1001 --ipc=host --init
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,8 +77,6 @@ jobs:
       - run: npm ci
       # The `chromium` channel runs extensions in new headless mode, so no xvfb is needed:
       # https://playwright.dev/docs/chrome-extensions
-      - name: Install Chromium (no headless shell)
-        run: npx playwright install --with-deps --no-shell chromium
       - run: npm run build
       - run: npm run test:e2e
       - name: Upload Playwright traces
