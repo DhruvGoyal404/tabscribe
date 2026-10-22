@@ -1,0 +1,40 @@
+{
+  "name": "tabscribe",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private, on-device captions for any browser tab.",
+  "license": "MIT",
+  "author": "Dhruv Goyal",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0",
+    "npm": ">=11.21.0"
+  },
+  "packageManager": "npm@11.21.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json && tsc -p src/tsconfig.json",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "check:release-age": "node scripts/check-release-age.mjs"
+  },
+  "devDependencies": {
+    "@crxjs/vite-plugin": "2.7.1",
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.64.0",
+    "@types/chrome": "0.3.4",
+    "@types/node": "22.20.5",
+    "eslint": "10.12.0",
+    "eslint-config-prettier": "10.1.8",
+    "globals": "17.13.0",
+    "prettier": "3.9.9",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.1",
+    "vite": "8.3.3",
+    "vitest": "5.0.3"
+  }
+}
