@@ -4,6 +4,9 @@ import manifest from './manifest.config.ts';
 
 export default defineConfig({
   plugins: [crx({ manifest })],
+  // The AudioWorklet is imported with `?worker&url` and loaded via audioWorklet.addModule,
+  // which expects a module script.
+  worker: { format: 'es' },
   build: {
     target: 'chrome116',
     rollupOptions: {
