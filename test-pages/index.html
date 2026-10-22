@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Tabscribe capture test page</title>
+    <style>
+      body {
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        font-family: system-ui, sans-serif;
+      }
+      iframe {
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Tabscribe capture test page</h1>
+
+    <h2>Plain &lt;audio&gt;</h2>
+    <p>
+      A 440 Hz tone in 2-second steps: −20 dBFS, −10 dBFS, full scale (≈ −3 dBFS RMS), −40 dBFS,
+      then silence. The popup meter should step with it.
+    </p>
+    <audio id="tone" controls loop src="/tone.wav"></audio>
+
+    <h2>YouTube iframe embed</h2>
+    <iframe
+      src="https://www.youtube-nocookie.com/embed/jNQXAC9IVRw"
+      title="YouTube embed"
+      allow="autoplay; encrypted-media; picture-in-picture"
+      allowfullscreen
+    ></iframe>
+  </body>
+</html>

@@ -20,7 +20,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "check:release-age": "node scripts/check-release-age.mjs"
+    "check:release-age": "node scripts/check-release-age.mjs",
+    "serve:test-pages": "node scripts/serve-test-pages.mjs"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "2.7.1",
