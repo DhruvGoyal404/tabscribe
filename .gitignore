@@ -1,0 +1,20 @@
+# Secrets
+.env
+.env.*
+
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+*.zip
+
+# Playwright
+playwright-report/
+test-results/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
