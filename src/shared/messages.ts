@@ -9,7 +9,8 @@ export type Message =
   | { type: 'capture/start'; tabId: number }
   | { type: 'capture/stop' }
   /** service worker -> offscreen document */
-  | { type: 'offscreen/start'; streamId: string }
+  | { type: 'offscreen/start'; streamId: string; muted: boolean }
+  | { type: 'offscreen/set-muted'; muted: boolean }
   | { type: 'offscreen/stop' }
   /** offscreen document -> service worker */
   | { type: 'offscreen/track-ended' }
@@ -55,9 +56,12 @@ export function isMessage(value: unknown): value is Message {
       return hasExactKeys(value, ['type']);
     case 'offscreen/start':
       return (
-        hasExactKeys(value, ['type', 'streamId']) &&
-        isBoundedString(value.streamId, MAX_STREAM_ID_LENGTH)
+        hasExactKeys(value, ['type', 'streamId', 'muted']) &&
+        isBoundedString(value.streamId, MAX_STREAM_ID_LENGTH) &&
+        typeof value.muted === 'boolean'
       );
+    case 'offscreen/set-muted':
+      return hasExactKeys(value, ['type', 'muted']) && typeof value.muted === 'boolean';
     case 'offscreen/error':
       return (
         hasExactKeys(value, ['type', 'message']) && isBoundedString(value.message, MAX_ERROR_LENGTH)

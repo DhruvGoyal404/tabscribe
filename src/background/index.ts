@@ -18,6 +18,7 @@ import {
   type Message,
   type Reply,
 } from '../shared/messages';
+import { mutedChange } from './tab-sync';
 
 const OFFSCREEN_PATH = 'src/offscreen/index.html';
 const BADGE_COLOR = '#1f5ed6';
@@ -105,8 +106,15 @@ async function startCapture(tabId: number): Promise<void> {
   try {
     // Allowed because opening the popup invoked the extension on this tab (an activeTab grant).
     const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+    // mutedInfo isn't one of the fields gated by the "tabs" permission. Later changes arrive via
+    // tabs.onUpdated, queued behind this start.
+    const { mutedInfo } = await chrome.tabs.get(tabId);
     await ensureOffscreenDocument();
-    await sendToOffscreen({ type: 'offscreen/start', streamId });
+    await sendToOffscreen({
+      type: 'offscreen/start',
+      streamId,
+      muted: mutedInfo?.muted ?? false,
+    });
     await dispatch({ type: 'started' });
   } catch (error) {
     await fail(error);
@@ -151,7 +159,7 @@ chrome.runtime.onMessage.addListener(
         void serialize(() => fail(message.message));
         return false;
       default:
-        // offscreen/start and offscreen/stop are addressed to the offscreen document.
+        // offscreen/start, offscreen/set-muted and offscreen/stop are for the offscreen document.
         return false;
     }
   },
@@ -160,6 +168,16 @@ chrome.runtime.onMessage.addListener(
 chrome.tabs.onRemoved.addListener((tabId) => {
   void serialize(async () => {
     if (capturedTabId(await readState()) === tabId) await stopCapture();
+  });
+});
+
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (!change.mutedInfo) return;
+  void serialize(async () => {
+    const muted = mutedChange(await readState(), tabId, change);
+    if (muted !== undefined) await sendToOffscreen({ type: 'offscreen/set-muted', muted });
+  }).catch((error: unknown) => {
+    console.warn('[tabscribe] could not follow the tab mute state', error);
   });
 });
 
