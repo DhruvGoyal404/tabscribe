@@ -10,8 +10,12 @@ test('extension service worker starts', async () => {
     args: [`--disable-extensions-except=${extensionPath}`, `--load-extension=${extensionPath}`],
   });
   try {
-    const worker = context.serviceWorkers()[0] ?? (await context.waitForEvent('serviceworker'));
-    expect(worker.url()).toMatch(/^chrome-extension:\/\/[a-p]{32}\//);
+    // Poll rather than waitForEvent: the worker can register before the listener attaches.
+    await expect
+      .poll(() => context.serviceWorkers().map((worker) => worker.url()))
+      .toContainEqual(
+        expect.stringMatching(/^chrome-extension:\/\/[a-p]{32}\/service-worker-loader\.js$/),
+      );
   } finally {
     await context.close();
   }
