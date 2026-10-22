@@ -90,7 +90,8 @@ async function main() {
       async () =>
         (await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] })).length,
     );
-  const badge = () => sw(() => chrome.action.getBadgeText({}));
+  // The badge is per tab: the captured tab shows ON, every other tab nothing.
+  const badge = (tabId) => sw((id) => chrome.action.getBadgeText({ tabId: id }), tabId);
   const targets = async () =>
     (await cdp.send('Target.getTargets', { filter: [{}] })).result.targetInfos;
 
@@ -159,13 +160,15 @@ async function main() {
     };
   }
 
-  const summary = async (label) =>
+  const summary = async (label, ...tabIds) =>
     log(
       label,
       JSON.stringify({
         state: await state(),
         offscreen: await offscreenCount(),
-        badge: await badge(),
+        badges: Object.fromEntries(
+          await Promise.all(tabIds.map(async (id) => [id, await badge(id)])),
+        ),
       }),
     );
 
@@ -196,7 +199,7 @@ async function main() {
     '| error:',
     await popup.text('error'),
   );
-  await summary('2 after start');
+  await summary('2 after start', a.tabId);
   log('2 levels over the tone steps:', await popup.levels(10));
 
   // 3. Popup closed then reopened mid-capture: meter must resume.
@@ -205,8 +208,19 @@ async function main() {
   popup = await openPopup(a.page);
   log('3 reopened status:', await popup.text('status'), '| levels:', await popup.levels(3));
 
-  // 4. Tab muted by the user.
+  // 4. Tab muted. The manifest has no "tabs" permission: check that mutedInfo is still readable
+  // and that tabs.onUpdated delivers it (the service worker forwards it to the passthrough gain).
+  await sw(() => {
+    globalThis.probeMuted = [];
+    chrome.tabs.onUpdated.addListener((_id, change) => {
+      if (change.mutedInfo) globalThis.probeMuted.push(change.mutedInfo.muted);
+    });
+  });
   await sw((id) => chrome.tabs.update(id, { muted: true }), a.tabId);
+  log(
+    '4 tabs.get mutedInfo without "tabs":',
+    JSON.stringify(await sw(async (id) => (await chrome.tabs.get(id)).mutedInfo, a.tabId)),
+  );
   // A full 10 s tone cycle, so muting is distinguishable from the tone's own quiet steps.
   log('4 muted levels:', await popup.levels(10));
   log(
@@ -214,6 +228,8 @@ async function main() {
     await sw(async (id) => (await chrome.tabs.get(id)).audible, a.tabId),
   );
   await sw((id) => chrome.tabs.update(id, { muted: false }), a.tabId);
+  await sleep(500);
+  log('4 onUpdated mutedInfo events:', JSON.stringify(await sw(() => globalThis.probeMuted)));
 
   await popup.close();
 
@@ -221,14 +237,14 @@ async function main() {
   await a.page.goto(TEST_PAGE + '?nav=1');
   await a.page.evaluate(() => document.querySelector('audio')?.play());
   await sleep(1500);
-  await summary('5 after same-origin navigation');
+  await summary('5 after same-origin navigation', a.tabId);
   popup = await openPopup(a.page);
   log('5 levels after navigation:', await popup.levels(3));
   await popup.close();
   await a.page.goto(TEST_PAGE.replace('127.0.0.1', 'localhost') + '?nav=2');
   await a.page.evaluate(() => document.querySelector('audio')?.play());
   await sleep(1500);
-  await summary('5 after cross-origin navigation');
+  await summary('5 after cross-origin navigation', a.tabId);
 
   // 6. Start on a second tab while the first is captured.
   const b = await openTestTab('?second=1');
@@ -249,12 +265,13 @@ async function main() {
     '| offscreen:',
     await offscreenCount(),
   );
+  await summary('6 badges after switching (first tab, second tab)', a.tabId, b.tabId);
   log('6 levels:', await popup.levels(2));
 
   // 7. User Stop.
   await popup.click('stop');
   log('7 status after stop:', await popup.waitForStatus(/Idle/));
-  await summary('7 after stop');
+  await summary('7 after stop', a.tabId, b.tabId);
 
   await popup.close();
 
@@ -265,7 +282,7 @@ async function main() {
   await popup.close();
   await b.page.close();
   await sleep(1500);
-  await summary('8 after closing captured tab');
+  await summary('8 after closing captured tab', a.tabId);
 
   cdp.close();
   await browser.close();

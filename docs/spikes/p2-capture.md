@@ -3,21 +3,23 @@
 **Goal:** prove the capture path end to end. Popup Start → tab audio captured → level meter in the
 popup → tab stays audible. No VAD, ASR or overlay yet.
 
-**Result:** the path works. The open questions are what the tab sounds like while captured (needs a
-human ear) and behaviour on DRM sites.
+**Result:** the path works, including on YouTube, embeds and a DRM site, with no audible change in
+quality or latency. The manual matrix found two bugs (tab mute ignored, badge in every window). Both
+are fixed below and need a re-test on Chrome stable.
 
 ## Architecture
 
 ```text
 popup ──capture/start {tabId}──▶ service worker
                                   │ tabCapture.getMediaStreamId({ targetTabId })
+                                  │ tabs.get(tabId).mutedInfo
                                   │ offscreen.createDocument(USER_MEDIA), one shared in-flight promise
                                   ▼
-                           offscreen document ◀── offscreen/start {streamId}
-                                  │ getUserMedia({ chromeMediaSource: 'tab' })
-                                  │ AudioContext (native rate)
-                                  │   source ──▶ destination          (passthrough, unity gain)
-                                  │   source ──▶ level-meter worklet ──▶ destination (silent)
+                           offscreen document ◀── offscreen/start {streamId, muted}
+                                  │ getUserMedia({ chromeMediaSource: 'tab' })        offscreen/set-muted
+                                  │ AudioContext (native rate)                        (tabs.onUpdated)
+                                  │   source ──▶ GainNode ──▶ destination   (passthrough, follows tab mute)
+                                  │   source ──▶ level-meter worklet ──▶ destination (silent, pre-gain)
                                   ▼
 popup ◀──── port "levels" ──── { rmsDbfs, peakDbfs, clipped } at ~20 Hz
 ```
@@ -28,9 +30,10 @@ popup ◀──── port "levels" ──── { rmsDbfs, peakDbfs, clipped } 
   storage and subscribes to `storage.session.onChanged`. Operations are serialized, so double clicks
   and overlapping triggers can't interleave.
 - **Teardown** runs on user Stop, `tabs.onRemoved` for the captured tab, the track's `ended` event,
-  and errors. It stops tracks, closes the AudioContext, closes the offscreen document, clears the
-  badge, and resets state. Starting on another tab stops the first capture cleanly, then starts the
-  new one.
+  and errors. It stops tracks, closes the AudioContext, closes the offscreen document, and resets
+  state. Starting on another tab stops the first capture cleanly, then starts the new one.
+- **Badge:** `ON` on the captured tab only, derived from the state on every transition
+  ([tab-sync.ts](../../src/background/tab-sync.ts)).
 - **Messages:** a discriminated union with a hand-written guard
   ([messages.ts](../../src/shared/messages.ts)). Unknown shapes and extra keys are rejected. Every
   `onMessage` and `onConnect` handler checks `sender.id === chrome.runtime.id`.
@@ -72,32 +75,74 @@ Verified empirically with the [probe](./p2-capture-probe.mjs) on Chromium 156:
 Caveat: after the tab navigates, Chrome drops the activeTab grant. Starting a _new_ capture then needs
 the popup opened again on that page, which happens naturally because Start lives in the popup.
 
+## Fixes from the manual matrix
+
+### Tab mute was ignored (matrix #7)
+
+Capturing a tab moves its playback into the offscreen document, so _Mute site_ marked the tab as
+muted but you still heard the audio. Captions while muted is a real use case, so capture keeps
+running and only what you hear follows the mute:
+
+- The passthrough goes through a `GainNode`. The level tap connects before it, so the meter (and
+  later the ASR pipeline) still gets audio while the tab is muted.
+- The service worker reads the initial `mutedInfo` with `tabs.get(tabId)` at start and sends it with
+  `offscreen/start`. Later changes come from `tabs.onUpdated` `changeInfo.mutedInfo` for the captured
+  tab only, and go to the offscreen document as `offscreen/set-muted`.
+- Gain changes ramp with `setTargetAtTime` (time constant 5 ms, within 2% after ~20 ms), so there's
+  no click.
+- **No new permission.** The [tabs docs](https://developer.chrome.com/docs/extensions/reference/api/tabs)
+  put only `url`, `pendingUrl`, `title` and `favIconUrl` behind `"tabs"`. The probe confirms it with
+  our manifest: `tabs.get` returned `{"muted":true,"reason":"extension",…}`, and `onUpdated` delivered
+  `mutedInfo` changes `[true, false]`.
+
+### Badge showed in every window (matrix #11)
+
+The badge was global. It is now set with `tabId` on the captured tab only, from a diff of the capture
+state on every transition: set on reaching `capturing`, cleared on stop, failure, tab close, and
+when **Capture this tab** switches to another tab.
+
+The [action docs](https://developer.chrome.com/docs/extensions/reference/api/action) only say a
+per-tab value "automatically resets when the tab is closed". **Empirically, Chrome also clears it
+when the tab navigates**, both same-origin and cross-origin (probe, Chromium 156), while capture
+survives navigation. So the service worker re-applies the badge on the captured tab's `onUpdated`
+`status` changes (`loading` and `complete`). The probe confirms `ON` on the captured tab after both
+navigations, nothing on the old tab after a switch, and no badge anywhere after Stop or tab close.
+
 ## Manual matrix
 
 **How to run:** `npm run build`, load `dist/` unpacked (see README), run `npm run serve:test-pages`
 and open <http://127.0.0.1:8137/>. "Probe" means verified by
 `node docs/spikes/p2-capture-probe.mjs <chromium.exe>` in headless Chromium 156, which can measure
-levels but can't listen.
+levels but can't listen. "Manual" means tested by hand on Chrome stable (Windows) unless noted.
 
-| #   | Case                                             | Status             | Result / steps                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| --- | ------------------------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Plain `<audio>` on the local test page           | ✅ Probe           | The meter tracked the tone exactly: −23.0 / −13.0 / −3.0 / −43.0 dBFS, then silence (expected RMS of the −20/−10/0/−40 dBFS-peak sine steps).                                                                                                                                                                                                                                                                                                                                                     |
-| 2   | Popup closed then reopened mid-capture           | ✅ Probe           | Reopened popup shows "Capturing this tab" and the meter resumes within about 1 s.                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| 3   | Switching to another tab while capturing         | ✅ Probe (state)   | Capture keeps running on the original tab. On the second tab the popup shows "Capturing another tab" with **Capture this tab**. Clicking it stops the first capture and starts the second: still exactly one offscreen document.                                                                                                                                                                                                                                                                  |
-| 4   | In-tab navigation                                | ✅ Probe           | Capture survives both same-origin and cross-origin navigation in the captured tab, and the meter keeps reading the new page's audio.                                                                                                                                                                                                                                                                                                                                                              |
-| 5   | Closing the captured tab                         | ✅ Probe           | State `idle`, 0 offscreen documents, badge cleared.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| 6   | User Stop                                        | ✅ Probe           | State `idle`, 0 offscreen documents, badge cleared.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| 7   | Tab muted by the user                            | ⚠️ Probe + **you** | **Surprise:** muting the tab does _not_ affect capture. Levels kept following the full tone cycle while muted, and `tab.audible` stayed true. Playback comes from the offscreen document's own AudioContext, so muting the tab probably doesn't silence what you hear. **Steps:** start capture on the test page, right-click the tab → _Mute site_, and listen. If the audio is still audible, the fix (P3/P4) is to watch `tabs.onUpdated` `mutedInfo` and drive a passthrough `GainNode` to 0. |
-| 8   | Tab stays audible; added latency or quality loss | 🔲 **You**         | Headless can't listen. **Steps:** play the test tone, note how it sounds, start capture, and listen for a gap, echo, lower quality or added delay. Then do the same with music on YouTube. Expected: unchanged quality (the context runs at the device's native rate), with possibly a few ms of output-buffer latency.                                                                                                                                                                           |
-| 9   | YouTube video                                    | 🔲 **You**         | Open any YouTube video, play it, open the popup on that tab → Start. Check: meter moves, audio stays audible, badge `ON`. Then try fullscreen and an ad break.                                                                                                                                                                                                                                                                                                                                    |
-| 10  | YouTube iframe embed on the test page            | 🔲 **You**         | Play the embed on the test page and start capture. Tab capture records the whole tab's mix, so the iframe should be included. Check that the meter moves.                                                                                                                                                                                                                                                                                                                                         |
-| 11  | Two windows                                      | 🔲 **You**         | Capture a tab in window A, focus window B, open the popup there. Expect "Capturing another tab", and **Capture this tab** switches over. Closing window A should tear down (same as #5).                                                                                                                                                                                                                                                                                                          |
-| 12  | DRM site (Netflix, Prime Video or Spotify web)   | 🔲 **You**         | Start capture on a playing title. Record: does the meter move, and do you still hear audio? Some DRM pipelines deliver silent or blocked audio to captures. If it's silent, the popup should still show `capturing`, and that's a product note, not a bug.                                                                                                                                                                                                                                        |
-| 13  | CPU usage                                        | 🔲 **You**         | Chrome menu → _More tools_ → _Task manager_. Note CPU% for the "Tabscribe" offscreen and extension rows, and the "Audio Service" utility process, while capturing and while idle. My headless attempt via CDP `SystemInfo.getProcessInfo` gave identical numbers for both, which isn't credible, so I dropped it.                                                                                                                                                                                 |
+| #   | Case                                             | Status                | Result                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| --- | ------------------------------------------------ | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Plain `<audio>` on the local test page           | ✅ Probe + manual     | The meter tracked the tone exactly: −23.0 / −13.0 / −3.0 / −43.0 dBFS, then silence (the expected RMS of the −20/−10/0/−40 dBFS-peak sine steps). Manual: −13.0 dBFS at the −10 dBFS-peak step.                                                                                                                                                                                                                                                                                                               |
+| 2   | Popup closed then reopened mid-capture           | ✅ Probe              | The reopened popup shows "Capturing this tab" and the meter resumes within about 1 s.                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 3   | Switching to another tab while capturing         | ✅ Probe              | Capture keeps running on the original tab. On the second tab the popup shows "Capturing another tab" with **Capture this tab**, which stops the first capture and starts the second: still exactly one offscreen document, and the badge moves to the new tab.                                                                                                                                                                                                                                                |
+| 4   | In-tab navigation                                | ✅ Probe              | Capture survives same-origin and cross-origin navigation, and the meter reads the new page's audio. The badge is re-applied after each navigation (see the fixes).                                                                                                                                                                                                                                                                                                                                            |
+| 5   | Closing the captured tab                         | ✅ Probe              | State `idle`, 0 offscreen documents, badge cleared.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 6   | User Stop                                        | ✅ Probe              | State `idle`, 0 offscreen documents, no badge on any tab.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 7   | Tab muted by the user (_Mute site_)              | 🔧 Fixed, **re-test** | **Bug (manual):** the tab showed as muted but stayed audible through our passthrough, and the meter kept moving. **Fixed:** the passthrough gain now follows the tab's mute state, and the meter keeps running because it is tapped before the gain. **Re-test:** mute and unmute while the tone plays. Audio should cut out and come back with no click, and the meter should keep moving throughout. Muting _inside_ the YouTube player silences the meter, which is expected: the source itself is silent. |
+| 8   | Tab stays audible; added latency or quality loss | ✅ Manual             | No audible difference in quality and no lip-sync drift with capture on vs off.                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 9   | YouTube video                                    | ✅ Manual             | The meter moves and the audio stays audible.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 10  | YouTube iframe embed on the test page            | ✅ Manual             | The embed's audio is in the tab mix, and the meter moves.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 11  | Two windows                                      | 🔧 Fixed, **re-test** | Manual: window B's popup correctly showed "Capturing another tab" with **Capture this tab**, and Stop stopped the single capture (both popups went to Idle). **UX bug:** the `ON` badge showed on the action icon in both windows, so you couldn't tell which tab was captured. **Fixed:** the badge is per tab. **Re-test:** capture in window A, and window B's icon has no badge. **Capture this tab** in B moves the badge to B's tab.                                                                    |
+| 12  | DRM site                                         | ✅ Manual (Brave)     | Prime Video in Brave (Chromium): audio **is** captured, the meter moves, and the tab stays audible. DRM blocks the video, not the audio.                                                                                                                                                                                                                                                                                                                                                                      |
+| 13  | CPU usage                                        | ✅ Manual             | Chrome Task Manager while capturing YouTube: "Extension: Tabscribe" at **2.3–4.4% CPU, ~37 MB**. See the baseline below.                                                                                                                                                                                                                                                                                                                                                                                      |
+
+### CPU baseline (for comparison after P3)
+
+P2 is capture, passthrough and a level meter only: **2.3–4.4% CPU and ~37 MB** for the "Extension:
+Tabscribe" row in Chrome's Task Manager while capturing YouTube on the developer's Windows machine. P3
+adds resampling, VAD and Whisper inference in the same offscreen document. Measure the same row with
+the same machine and video, so the cost of ASR shows against this number.
 
 ## Not covered (by design)
 
 - No VAD, ASR, overlay or 16 kHz resampling. Resampling belongs inside the P3 pipeline, not on the
   AudioContext, so the passthrough stays full quality.
 - e2e only checks that the popup renders the idle state. Real `tabCapture` isn't automated in CI. The
-  probe is a local tool and needs `--enable-unsafe-extension-debugging`.
+  probe is a local tool and needs `--enable-unsafe-extension-debugging`. It can't listen, so for the mute
+  fix it only confirms that the service worker receives `mutedInfo`. Whether the audio actually goes
+  silent needs the manual re-test.
