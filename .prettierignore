@@ -1,4 +1,5 @@
 dist/
+dist-bench/
 coverage/
 playwright-report/
 test-results/
