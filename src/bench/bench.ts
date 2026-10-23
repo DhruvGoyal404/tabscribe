@@ -22,7 +22,7 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from '../asr/protocol';
-import { ASR_SAMPLE_RATE, resampleTo16k } from '../asr/resample';
+import { ASR_SAMPLE_RATE, downmixToMono, Resampler } from '../asr/resample';
 import {
   PROFILE_OFFSETS,
   PROFILE_SECONDS,
@@ -34,6 +34,7 @@ import {
 } from './cost';
 import { FIXTURES, type Fixture } from './fixtures';
 import { characterErrorRate, wordErrorRate } from './metrics';
+import { runVad, type VadRun } from './vad-run';
 
 /** Cache API bucket Transformers.js stores model files in. */
 const MODEL_CACHE = 'transformers-cache';
@@ -87,6 +88,10 @@ const ui = {
   clearCosts: element('clear-costs', HTMLButtonElement),
   costs: element('costs', HTMLElement),
   costTexts: element('cost-texts', HTMLElement),
+  vadKind: element('vad-kind', HTMLSelectElement),
+  vadMax: element('vad-max', HTMLInputElement),
+  runVad: element('run-vad', HTMLButtonElement),
+  vadResults: element('vad-results', HTMLElement),
 };
 
 // --- Worker client ------------------------------------------------------------------------------
@@ -163,6 +168,7 @@ function setBusy(busy: boolean, loaded = currentModel !== null): void {
   ui.unload.disabled = busy || !loaded;
   ui.profile.disabled = busy || !loaded;
   ui.clearCache.disabled = busy;
+  ui.runVad.disabled = busy;
   for (const select of [ui.model, ui.device, ui.encoder, ui.decoder]) select.disabled = busy;
 }
 
@@ -188,11 +194,12 @@ async function cachedFlags(urls: string[]): Promise<boolean[]> {
 
 // --- Fixtures -----------------------------------------------------------------------------------
 
+const captured = new Map<Fixture['key'], Float32Array>();
 const decoded = new Map<Fixture['key'], Float32Array>();
 
-/** Decodes at 48 kHz (as tab capture delivers it), then resamples with our resampler. */
-async function fixtureAudio(fixture: Fixture): Promise<Float32Array> {
-  const cached = decoded.get(fixture.key);
+/** The fixture as tab capture would deliver it: mono at 48 kHz. */
+async function fixtureCapture(fixture: Fixture): Promise<Float32Array> {
+  const cached = captured.get(fixture.key);
   if (cached) return cached;
   const bytes = await (await fetch(fixture.url)).arrayBuffer();
   const context = new OfflineAudioContext({
@@ -201,10 +208,23 @@ async function fixtureAudio(fixture: Fixture): Promise<Float32Array> {
     sampleRate: CAPTURE_RATE,
   });
   const buffer = await context.decodeAudioData(bytes);
-  const channels = Array.from({ length: buffer.numberOfChannels }, (_, i) =>
-    buffer.getChannelData(i),
+  const mono = downmixToMono(
+    Array.from({ length: buffer.numberOfChannels }, (_, i) => buffer.getChannelData(i)),
   );
-  const audio = resampleTo16k(channels, buffer.sampleRate);
+  captured.set(fixture.key, mono);
+  return mono;
+}
+
+/** 16 kHz for Whisper, through our resampler as live audio will be. */
+async function fixtureAudio(fixture: Fixture): Promise<Float32Array> {
+  const cached = decoded.get(fixture.key);
+  if (cached) return cached;
+  const resampler = new Resampler({ inputRate: CAPTURE_RATE });
+  const head = resampler.push(await fixtureCapture(fixture));
+  const tail = resampler.flush();
+  const audio = new Float32Array(head.length + tail.length);
+  audio.set(head);
+  audio.set(tail, head.length);
   decoded.set(fixture.key, audio);
   return audio;
 }
@@ -380,6 +400,64 @@ function renderCosts(): void {
   );
 }
 
+const vadRuns: { fixture: Fixture['key']; run: VadRun }[] = [];
+
+const secondsAt = (sample: number): string => (sample / ASR_SAMPLE_RATE).toFixed(2);
+
+function vadCells({ fixture: key, run }: (typeof vadRuns)[number]): string[] {
+  const finals = run.events.filter((event) => event.type === 'final');
+  return [
+    key,
+    run.fallbackReason ? `${run.vad} (fallback: ${run.fallbackReason})` : run.vad,
+    String(finals.length),
+    String(run.stats.partials),
+    `${((100 * run.stats.speechFrames) / Math.max(1, run.stats.frames)).toFixed(0)}%`,
+    run.stats.msPerFrame.toFixed(2),
+    run.ms.toFixed(0),
+    finals
+      .map((e) => `${secondsAt(e.startSample)}–${secondsAt(e.endSample)} (${e.reason})`)
+      .join(', '),
+  ];
+}
+
+function renderVad(): void {
+  ui.vadResults.replaceChildren(
+    ...vadRuns.map((entry) => {
+      const tr = document.createElement('tr');
+      for (const text of vadCells(entry)) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.append(td);
+      }
+      return tr;
+    }),
+  );
+}
+
+async function runVadOnFixtures(): Promise<void> {
+  const { value: kind } = ui.vadKind;
+  if (kind !== 'silero' && kind !== 'energy') return;
+  const maxSegmentMs = Number(ui.vadMax.value);
+  showError('');
+  setBusy(true);
+  try {
+    for (const entry of FIXTURES) {
+      ui.progress.textContent = `VAD: ${entry.key}…`;
+      const run = await runVad(await fixtureCapture(entry), CAPTURE_RATE, kind, {
+        maxSegmentMs,
+      });
+      vadRuns.push({ fixture: entry.key, run });
+      renderVad();
+    }
+    ui.progress.textContent = 'VAD done.';
+  } catch (error) {
+    showError(String(error));
+    ui.progress.textContent = '';
+  } finally {
+    setBusy(false);
+  }
+}
+
 function markdown(): string {
   const header = [
     'Model', 'Device', 'Enc / Dec', 'Load', 'Load (s)', 'EN RTF 1st', 'EN RTF 2nd', 'EN WER',
@@ -409,6 +487,20 @@ function markdown(): string {
     ]),
     line(Array.from({ length: 9 }, () => '---')),
     ...costs.map((row) => line(costCells(row))),
+    '',
+    '### VAD',
+    line([
+      'Fixture',
+      'VAD',
+      'Segments',
+      'Partials',
+      'Speech',
+      'ms / frame',
+      'Stream (ms)',
+      'Segments',
+    ]),
+    line(Array.from({ length: 8 }, () => '---')),
+    ...vadRuns.map((entry) => line(vadCells(entry))),
     '',
     '### Outputs',
     ...rows.flatMap((row) => [
@@ -599,6 +691,7 @@ fillSelect(ui.model, MODEL_KEYS, 'whisper-base');
 fillSelect(ui.device, DEVICES, 'webgpu');
 fillSelect(ui.encoder, DTYPES, 'fp32');
 fillSelect(ui.decoder, DTYPES, 'q4');
+fillSelect(ui.vadKind, ['silero', 'energy'], 'silero');
 
 for (const select of [ui.model, ui.device, ui.encoder, ui.decoder]) {
   select.addEventListener('change', () => void updateSize());
@@ -616,6 +709,7 @@ ui.copy.addEventListener('click', () => {
   );
 });
 ui.profile.addEventListener('click', () => void profileCalls());
+ui.runVad.addEventListener('click', () => void runVadOnFixtures());
 ui.clearCosts.addEventListener('click', () => {
   costs.length = 0;
   store(COSTS_KEY, costs);

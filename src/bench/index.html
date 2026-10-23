@@ -115,6 +115,44 @@
       <div id="cost-texts"></div>
     </section>
 
+    <section aria-labelledby="vad-heading">
+      <h2 id="vad-heading">Voice activity (VAD worker)</h2>
+      <p class="note">
+        Streams each fixture at 48 kHz through the VAD worker, the way the capture worklet will, and
+        lists the speech segments it cuts. No model download is needed: Silero is bundled.
+      </p>
+      <div class="controls">
+        <label
+          >VAD
+          <select id="vad-kind"></select
+        ></label>
+        <label
+          >Max segment (ms)
+          <input id="vad-max" type="number" min="1000" max="30000" step="500" value="10000"
+        /></label>
+      </div>
+      <div class="buttons">
+        <button id="run-vad" type="button">Run VAD on fixtures</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Fixture</th>
+              <th>VAD</th>
+              <th>Segments</th>
+              <th>Partials</th>
+              <th>Speech</th>
+              <th>ms / frame</th>
+              <th>Stream (ms)</th>
+              <th>Segments: start–end s (reason)</th>
+            </tr>
+          </thead>
+          <tbody id="vad-results"></tbody>
+        </table>
+      </div>
+    </section>
+
     <script type="module" src="./bench.ts"></script>
   </body>
 </html>

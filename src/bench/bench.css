@@ -76,6 +76,7 @@ dd {
 }
 
 select,
+input,
 button {
   font: inherit;
   padding: 4px 10px;
