@@ -23,6 +23,15 @@ import {
   type WorkerResponse,
 } from '../asr/protocol';
 import { ASR_SAMPLE_RATE, resampleTo16k } from '../asr/resample';
+import {
+  PROFILE_OFFSETS,
+  PROFILE_SECONDS,
+  secondsToSamples,
+  segmentOffsets,
+  summarise,
+  type CallTiming,
+  type CostRow,
+} from './cost';
 import { FIXTURES, type Fixture } from './fixtures';
 import { characterErrorRate, wordErrorRate } from './metrics';
 
@@ -31,6 +40,7 @@ const MODEL_CACHE = 'transformers-cache';
 /** Fixtures are decoded at a typical tab-capture rate and resampled like live audio will be. */
 const CAPTURE_RATE = 48_000;
 const RESULTS_KEY = 'tabscribe-bench-results';
+const COSTS_KEY = 'tabscribe-bench-costs';
 
 interface BenchRow {
   model: ModelKey;
@@ -73,6 +83,10 @@ const ui = {
   clearResults: element('clear-results', HTMLButtonElement),
   results: element('results', HTMLElement),
   outputs: element('outputs', HTMLElement),
+  profile: element('profile', HTMLButtonElement),
+  clearCosts: element('clear-costs', HTMLButtonElement),
+  costs: element('costs', HTMLElement),
+  costTexts: element('cost-texts', HTMLElement),
 };
 
 // --- Worker client ------------------------------------------------------------------------------
@@ -147,6 +161,7 @@ function setBusy(busy: boolean, loaded = currentModel !== null): void {
   ui.load.disabled = busy;
   ui.run.disabled = busy || !loaded;
   ui.unload.disabled = busy || !loaded;
+  ui.profile.disabled = busy || !loaded;
   ui.clearCache.disabled = busy;
   for (const select of [ui.model, ui.device, ui.encoder, ui.decoder]) select.disabled = busy;
 }
@@ -202,27 +217,34 @@ function fixture(key: Fixture['key']): Fixture {
 
 // --- Results ------------------------------------------------------------------------------------
 
-function loadRows(): BenchRow[] {
+function loadStored<T>(key: string): T[] {
   try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(RESULTS_KEY) ?? '[]');
-    return Array.isArray(parsed) ? (parsed as BenchRow[]) : [];
+    const parsed: unknown = JSON.parse(localStorage.getItem(key) ?? '[]');
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
   } catch {
     return [];
   }
 }
 
-const rows = loadRows();
-
-function saveRows(): void {
+function store(key: string, values: readonly unknown[]): void {
   try {
-    localStorage.setItem(RESULTS_KEY, JSON.stringify(rows));
+    localStorage.setItem(key, JSON.stringify(values));
   } catch {
     // Results stay on screen; only persistence across reloads is lost.
   }
 }
 
-const label = (row: BenchRow): string =>
-  `${row.model} · ${row.device} · ${row.dtype.encoder}/${row.dtype.decoder}`;
+const rows = loadStored<BenchRow>(RESULTS_KEY);
+const costs = loadStored<CostRow>(COSTS_KEY);
+
+function saveRows(): void {
+  store(RESULTS_KEY, rows);
+}
+
+const configLabel = (model: ModelKey, device: Device, dtype: DtypeSpec): string =>
+  `${model} · ${device} · ${dtype.encoder}/${dtype.decoder}`;
+
+const label = (row: BenchRow): string => configLabel(row.model, row.device, row.dtype);
 
 function cells(row: BenchRow): string[] {
   return [
@@ -315,6 +337,49 @@ function renderEnvironment(): void {
   );
 }
 
+function costCells(row: CostRow): string[] {
+  return [
+    row.config,
+    String(row.seconds),
+    row.featuresMs.toFixed(0),
+    row.encoderMs.toFixed(0),
+    row.decoderMs.toFixed(0),
+    row.decoderSteps.toFixed(0),
+    row.msPerStep.toFixed(1),
+    row.totalMs.toFixed(0),
+    row.callRtf.toFixed(3),
+  ];
+}
+
+function renderCosts(): void {
+  ui.costs.replaceChildren(
+    ...costs.map((row) => {
+      const tr = document.createElement('tr');
+      for (const text of costCells(row)) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.append(td);
+      }
+      return tr;
+    }),
+  );
+  ui.costTexts.replaceChildren(
+    ...costs.map((row) => {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = `Decoded text: ${row.config}, ${String(row.seconds)} s segments`;
+      const list = document.createElement('ol');
+      for (const text of row.texts) {
+        const item = document.createElement('li');
+        item.textContent = text;
+        list.append(item);
+      }
+      details.append(summary, list);
+      return details;
+    }),
+  );
+}
+
 function markdown(): string {
   const header = [
     'Model', 'Device', 'Enc / Dec', 'Load', 'Load (s)', 'EN RTF 1st', 'EN RTF 2nd', 'EN WER',
@@ -329,6 +394,21 @@ function markdown(): string {
     line(header),
     line(header.map(() => '---')),
     ...rows.map((row) => line(cells(row))),
+    '',
+    '### Per-call cost',
+    line([
+      'Config',
+      'Segment (s)',
+      'Features (ms)',
+      'Encoder (ms)',
+      'Decoder (ms)',
+      'Decoder steps',
+      'ms / step',
+      'Total (ms)',
+      'Call RTF',
+    ]),
+    line(Array.from({ length: 9 }, () => '---')),
+    ...costs.map((row) => line(costCells(row))),
     '',
     '### Outputs',
     ...rows.flatMap((row) => [
@@ -447,6 +527,40 @@ async function runBenchmark(): Promise<void> {
   }
 }
 
+async function profileCalls(): Promise<void> {
+  const loaded = currentModel;
+  if (!loaded) return;
+  showError('');
+  setBusy(true);
+  try {
+    const audio = await fixtureAudio(fixture('en'));
+    const profileOne = (segment: Float32Array) => {
+      const copy = segment.slice();
+      return send('profile', (id) => ({ type: 'profile', id, audio: copy }), [copy.buffer]);
+    };
+    ui.progress.textContent = 'Per-call cost: warm-up…';
+    await profileOne(audio.subarray(0, secondsToSamples(PROFILE_SECONDS[0])));
+    const config = configLabel(loaded.model, loaded.device, loaded.dtype);
+    for (const seconds of PROFILE_SECONDS) {
+      const length = secondsToSamples(seconds);
+      const timings: CallTiming[] = [];
+      for (const offset of segmentOffsets(audio.length, length, PROFILE_OFFSETS)) {
+        ui.progress.textContent = `Per-call cost: ${String(seconds)} s segment at ${(offset / ASR_SAMPLE_RATE).toFixed(1)} s…`;
+        timings.push(await profileOne(audio.subarray(offset, offset + length)));
+      }
+      costs.push(summarise(config, seconds, timings));
+      store(COSTS_KEY, costs);
+      renderCosts();
+    }
+    ui.progress.textContent = `Per-call cost done: ${config}.`;
+  } catch (error) {
+    showError(String(error));
+    ui.progress.textContent = '';
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function unloadModel(): Promise<void> {
   setBusy(true);
   try {
@@ -501,6 +615,12 @@ ui.copy.addEventListener('click', () => {
     },
   );
 });
+ui.profile.addEventListener('click', () => void profileCalls());
+ui.clearCosts.addEventListener('click', () => {
+  costs.length = 0;
+  store(COSTS_KEY, costs);
+  renderCosts();
+});
 ui.clearResults.addEventListener('click', () => {
   rows.length = 0;
   saveRows();
@@ -509,6 +629,7 @@ ui.clearResults.addEventListener('click', () => {
 
 renderEnvironment();
 renderRows();
+renderCosts();
 setBusy(false);
 void updateSize();
 void send('gpu-info', (id) => ({ type: 'gpu-info', id })).then(
