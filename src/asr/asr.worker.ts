@@ -85,7 +85,21 @@ async function load(request: Extract<WorkerRequest, { type: 'load' }>): Promise<
       }
     },
   });
+  allowPrecomputedEncoderOutput(asr);
   post({ type: 'loaded', id: request.id, ms: performance.now() - started });
+}
+
+/**
+ * Whisper's `forward_params` in Transformers.js 4.3.1 omit `encoder_outputs`, so generate()
+ * silently drops a precomputed encoder output and runs the encoder again. Allowing it on this
+ * instance lets one encoder pass serve several decoder runs (profiling now; no-speech detection,
+ * then decoding, in P3b).
+ */
+function allowPrecomputedEncoderOutput(pipe: AutomaticSpeechRecognitionPipeline): void {
+  const model = pipe.model as unknown as { forward_params: string[] };
+  if (!model.forward_params.includes('encoder_outputs')) {
+    model.forward_params = [...model.forward_params, 'encoder_outputs'];
+  }
 }
 
 async function unload(): Promise<void> {
@@ -154,6 +168,61 @@ async function transcribe(
   return { text: text.trim(), language, detectMs, ms: performance.now() - started };
 }
 
+/** A raw ONNX Runtime tensor: the single-argument form of Transformers.js's Tensor constructor. */
+type OrtTensor = Extract<ConstructorParameters<typeof Tensor>, [unknown]>[0];
+
+/** The ONNX Runtime session Transformers.js keeps for the Whisper encoder. */
+interface EncoderSession {
+  run(feeds: Record<string, OrtTensor>): Promise<Record<string, OrtTensor | undefined>>;
+}
+
+/** <|startoftranscript|> <|en|> <|transcribe|> <|notimestamps|> */
+const PROMPT_TOKENS = 4;
+
+/**
+ * Times the parts of one English decode separately. The encoder runs on its own session, then
+ * generate() decodes from its output (it skips the encoder when `encoder_outputs` is given). The
+ * encoder's output is read back to the CPU (only the decoder's KV cache stays on the GPU), so the
+ * encoder time includes the work actually finishing.
+ */
+async function profile(
+  audio: Float32Array,
+): Promise<Omit<Extract<WorkerResponse, { type: 'profile' }>, 'type' | 'id'>> {
+  const pipe = asr;
+  if (!pipe) throw new Error('No model loaded.');
+  const started = performance.now();
+  const { input_features } = (await pipe.processor(audio)) as { input_features: Tensor };
+  const featured = performance.now();
+  const encoder = (
+    pipe.model as unknown as { sessions: Record<string, EncoderSession | undefined> }
+  ).sessions.model;
+  if (!encoder) throw new Error('Whisper encoder session not found.');
+  const encoded = await encoder.run({ input_features: input_features.ort_tensor });
+  const encoderDone = performance.now();
+  const lastHiddenState = encoded.last_hidden_state;
+  if (!lastHiddenState) throw new Error('Encoder returned no last_hidden_state.');
+  const generate = pipe.model.generate.bind(pipe.model) as (
+    options: Record<string, unknown>,
+  ) => Promise<unknown>;
+  const output = (await generate({
+    inputs: input_features,
+    encoder_outputs: new Tensor(lastHiddenState),
+    language: 'en',
+    task: 'transcribe',
+    max_new_tokens: 224,
+  })) as Tensor;
+  const decoded = performance.now();
+  const tokens = output.tolist() as bigint[][];
+  const text = pipe.tokenizer.decode(tokens[0] ?? [], { skip_special_tokens: true }).trim();
+  return {
+    featuresMs: featured - started,
+    encoderMs: encoderDone - featured,
+    decoderMs: decoded - encoderDone,
+    decoderSteps: Math.max(0, (output.dims[1] ?? 0) - PROMPT_TOKENS),
+    text,
+  };
+}
+
 async function handle(request: WorkerRequest): Promise<void> {
   switch (request.type) {
     case 'gpu-info':
@@ -168,6 +237,9 @@ async function handle(request: WorkerRequest): Promise<void> {
         id: request.id,
         ...(await transcribe(request.audio, request.task, request.language)),
       });
+      return;
+    case 'profile':
+      post({ type: 'profile', id: request.id, ...(await profile(request.audio)) });
       return;
     case 'unload':
       await unload();

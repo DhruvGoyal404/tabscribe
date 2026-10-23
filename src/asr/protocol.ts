@@ -14,6 +14,8 @@ export type AsrTask = 'transcribe' | 'translate';
 
 /** Longest clip accepted in one request: 10 minutes of 16 kHz audio. */
 export const MAX_AUDIO_SAMPLES = 16_000 * 600;
+/** Whisper's window: one encoder pass covers at most 30 s of 16 kHz audio. */
+export const MAX_WINDOW_SAMPLES = 16_000 * 30;
 
 export type WorkerRequest =
   | { type: 'gpu-info'; id: number }
@@ -21,6 +23,11 @@ export type WorkerRequest =
   | { type: 'load'; id: number; model: ModelKey; device: Device; dtype: DtypeSpec }
   /** 16 kHz mono. `language: null` detects the language from the first 30 s. */
   | { type: 'transcribe'; id: number; audio: Float32Array; task: AsrTask; language: string | null }
+  /**
+   * Times one English decode of a single window (at most 30 s) in its parts: feature extraction,
+   * the encoder session, then greedy decoding from the encoder output.
+   */
+  | { type: 'profile'; id: number; audio: Float32Array }
   | { type: 'unload'; id: number };
 
 export type GpuInfo =
@@ -51,6 +58,16 @@ export type WorkerResponse =
       detectMs: number | null;
       /** Total processing time, including detection. */
       ms: number;
+    }
+  | {
+      type: 'profile';
+      id: number;
+      featuresMs: number;
+      encoderMs: number;
+      decoderMs: number;
+      /** Decoder steps run, including the end-of-text token (excludes the 4 prompt tokens). */
+      decoderSteps: number;
+      text: string;
     }
   | { type: 'unloaded'; id: number }
   | { type: 'error'; id: number; message: string };
@@ -102,6 +119,13 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
         value.audio.length <= MAX_AUDIO_SAMPLES &&
         (value.task === 'transcribe' || value.task === 'translate') &&
         (value.language === null || isLanguageCode(value.language))
+      );
+    case 'profile':
+      return (
+        hasExactKeys(value, ['type', 'id', 'audio']) &&
+        value.audio instanceof Float32Array &&
+        value.audio.length > 0 &&
+        value.audio.length <= MAX_WINDOW_SAMPLES
       );
     default:
       return false;
@@ -160,6 +184,24 @@ export function isWorkerResponse(value: unknown): value is WorkerResponse {
         isLanguageCode(value.language) &&
         (value.detectMs === null || isCount(value.detectMs)) &&
         isCount(value.ms)
+      );
+    case 'profile':
+      return (
+        hasExactKeys(value, [
+          'type',
+          'id',
+          'featuresMs',
+          'encoderMs',
+          'decoderMs',
+          'decoderSteps',
+          'text',
+        ]) &&
+        isCount(value.featuresMs) &&
+        isCount(value.encoderMs) &&
+        isCount(value.decoderMs) &&
+        Number.isSafeInteger(value.decoderSteps) &&
+        isCount(value.decoderSteps) &&
+        isShortString(value.text, 100_000)
       );
     case 'unloaded':
       return hasExactKeys(value, ['type', 'id']);
