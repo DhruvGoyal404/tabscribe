@@ -31,6 +31,15 @@ export default defineManifest({
   },
   permissions: ['activeTab', 'tabCapture', 'offscreen', 'scripting', 'storage'],
   content_security_policy: {
-    extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';",
+    // connect-src: our own files plus Hugging Face, where the pinned Whisper weights live.
+    // huggingface.co serves the JSON configs; the ONNX weights redirect to its CDN, whose host
+    // depends on region and storage backend (e.g. us.aws.cdn.hf.co), hence *.hf.co.
+    extension_pages: [
+      "script-src 'self' 'wasm-unsafe-eval'",
+      "object-src 'self'",
+      "connect-src 'self' https://huggingface.co https://*.hf.co",
+    ]
+      .join('; ')
+      .concat(';'),
   },
 });
