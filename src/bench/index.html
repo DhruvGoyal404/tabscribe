@@ -83,6 +83,38 @@
       <div id="outputs"></div>
     </section>
 
+    <section aria-labelledby="cost-heading">
+      <h2 id="cost-heading">Per-call cost</h2>
+      <p class="note">
+        With the loaded model: one English decode of a 2, 5, 10 and 15 s segment, each taken from
+        three places in the English clip after a warm-up call. Feature extraction, encoder and
+        decoder are timed separately. Medians are shown.
+      </p>
+      <div class="buttons">
+        <button id="profile" type="button" disabled>Measure per-call cost</button>
+        <button id="clear-costs" type="button">Clear per-call results</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Config</th>
+              <th>Segment (s)</th>
+              <th>Features (ms)</th>
+              <th>Encoder (ms)</th>
+              <th>Decoder (ms)</th>
+              <th>Decoder steps</th>
+              <th>ms / step</th>
+              <th>Total (ms)</th>
+              <th>Call RTF</th>
+            </tr>
+          </thead>
+          <tbody id="costs"></tbody>
+        </table>
+      </div>
+      <div id="cost-texts"></div>
+    </section>
+
     <script type="module" src="./bench.ts"></script>
   </body>
 </html>
