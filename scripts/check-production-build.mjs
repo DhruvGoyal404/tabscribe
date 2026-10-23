@@ -11,7 +11,16 @@ const PERMISSIONS = ['activeTab', 'tabCapture', 'offscreen', 'scripting', 'stora
 const CSP =
   "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; " +
   "connect-src 'self' https://huggingface.co https://*.hf.co;";
-const FORBIDDEN = [/(^|\/)bench(\/|\.|-)/, /\.flac$/, /\.onnx$/, /ort-wasm/, /asr\.worker/];
+// Until P3b wires ASR into the offscreen document, its workers and models are bench-only.
+const FORBIDDEN = [
+  /(^|\/)bench(\/|\.|-)/,
+  /\.flac$/,
+  /\.onnx$/,
+  /ort-wasm/,
+  /asr\.worker/,
+  /vad\.worker/,
+  /silero/,
+];
 
 const problems = [];
 const manifest = JSON.parse(await readFile(path.join(DIST, 'manifest.json'), 'utf8'));
