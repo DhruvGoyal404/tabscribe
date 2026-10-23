@@ -22,6 +22,8 @@
     "test": "vitest run",
     "test:e2e": "playwright test",
     "check:release-age": "node scripts/check-release-age.mjs",
+    "check:playwright-image": "node scripts/check-playwright-image.mjs",
+    "check:dist": "node scripts/check-production-build.mjs",
     "serve:test-pages": "node scripts/serve-test-pages.mjs"
   },
   "devDependencies": {
