@@ -2,11 +2,14 @@
 
 Private, on-device captions for any browser tab.
 
-Tabscribe is a Chrome extension (Manifest V3) that captions the audio playing in a tab, in many
-languages, with an option to translate the captions into English. Speech recognition runs
-locally with [Whisper](https://github.com/openai/whisper) through
-[Transformers.js](https://github.com/huggingface/transformers.js): WebGPU when available
-(`whisper-base`), WebAssembly otherwise (`whisper-tiny`).
+Tabscribe is a Chrome extension (Manifest V3) that captions the audio playing in a tab. Speech
+recognition runs locally with [Whisper](https://github.com/openai/whisper) through
+[Transformers.js](https://github.com/huggingface/transformers.js): `whisper-base` on WebGPU when
+your device has a GPU adapter, and on WebAssembly otherwise.
+
+**English first.** Other languages, and translating captions into English, will be turned on one
+language at a time, and only once they pass our on-device benchmark. Hindi doesn't pass yet (see
+[the benchmark](docs/spikes/p3-asr-bench.md)).
 
 > **Status:** early development. The extension loads, but captioning isn't implemented yet.
 
@@ -18,6 +21,14 @@ locally with [Whisper](https://github.com/openai/whisper) through
   pinned to a fixed revision and cached locally.
 - A future, **opt-in** cloud mode will use your own Hugging Face token and send audio only to
   Hugging Face, only while you have it switched on.
+
+## Roadmap
+
+- **P3b:** live English captions (streaming, with repetition guards), shown in the popup.
+- **P3c:** Hindi spike: re-test with the guards, look for openly licensed Hindi fine-tuned
+  Whisper models, or offer Hindi through the opt-in cloud mode.
+- **P4:** caption overlay on the page.
+- **P6:** opt-in bring-your-own-key cloud mode.
 
 ## Development
 
