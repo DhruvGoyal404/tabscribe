@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { downloadBytes, MODEL_KEYS, MODELS, modelFileUrls } from './models';
-import { isLanguageCode, isWorkerRequest, isWorkerResponse, MAX_AUDIO_SAMPLES } from './protocol';
+import {
+  isLanguageCode,
+  isWorkerRequest,
+  isWorkerResponse,
+  MAX_AUDIO_SAMPLES,
+  MAX_WINDOW_SAMPLES,
+} from './protocol';
 
 const audio = new Float32Array(16_000);
 const dtype = { encoder: 'fp32', decoder: 'q4' };
@@ -14,6 +20,8 @@ describe('isWorkerRequest', () => {
     { type: 'transcribe', id: 2, audio, task: 'transcribe', language: null },
     { type: 'transcribe', id: 2, audio, task: 'transcribe', language: 'hi' },
     { type: 'transcribe', id: 2, audio, task: 'translate', language: 'hi' },
+    { type: 'profile', id: 4, audio },
+    { type: 'profile', id: 4, audio: new Float32Array(MAX_WINDOW_SAMPLES) },
   ])('accepts %o', (request) => {
     expect(isWorkerRequest(request)).toBe(true);
   });
@@ -36,6 +44,8 @@ describe('isWorkerRequest', () => {
     ['an unknown task', { type: 'transcribe', id: 2, audio, task: 'summarise', language: null }],
     ['a language name', { type: 'transcribe', id: 2, audio, task: 'transcribe', language: 'hindi' }],
     ['a missing language', { type: 'transcribe', id: 2, audio, task: 'transcribe' }],
+    ['a profile longer than one window', { type: 'profile', id: 4, audio: new Float32Array(MAX_WINDOW_SAMPLES + 1) }],
+    ['a profile with options', { type: 'profile', id: 4, audio, language: 'en' }],
   ])('rejects %s', (_label, request) => {
     expect(isWorkerRequest(request)).toBe(false);
   });
@@ -61,6 +71,7 @@ describe('isWorkerResponse', () => {
     { type: 'loaded', id: 1, ms: 1234.5 },
     { type: 'result', id: 2, text: 'hello', language: 'en', detectMs: null, ms: 900 },
     { type: 'result', id: 2, text: 'नमस्ते', language: 'hi', detectMs: 120, ms: 900 },
+    { type: 'profile', id: 4, featuresMs: 12, encoderMs: 800, decoderMs: 450, decoderSteps: 31, text: 'hi' },
     { type: 'unloaded', id: 3 },
     { type: 'error', id: 3, message: 'boom' },
   ])('accepts %o', (response) => {
@@ -73,6 +84,7 @@ describe('isWorkerResponse', () => {
     ['NaN timing', { type: 'loaded', id: 1, ms: NaN }],
     ['a result without a language', { type: 'result', id: 2, text: 'hi', detectMs: null, ms: 1 }],
     ['a non-string error', { type: 'error', id: 3, message: 42 }],
+    ['fractional decoder steps', { type: 'profile', id: 4, featuresMs: 1, encoderMs: 1, decoderMs: 1, decoderSteps: 1.5, text: '' }],
   ])('rejects %s', (_label, response) => {
     expect(isWorkerResponse(response)).toBe(false);
   });
