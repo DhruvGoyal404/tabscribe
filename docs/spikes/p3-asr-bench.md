@@ -4,8 +4,11 @@
 target machine (Windows), not from library defaults. P3a builds the ASR worker, the resampler and a
 benchmark. Live captions are P3b.
 
-**Status:** harness done and smoke-tested with whisper-tiny. The result tables below are for the
-real runs on the target machine.
+**Status:** done. Measured on the target machine (see [Results](#results)).
+
+**Decision:** default to **whisper-base on WebGPU, fp16/fp16**. Fall back to **whisper-base on WASM,
+q8/q8** when there's no hardware adapter. **English-first:** Hindi isn't shippable on-device yet
+(see [Decisions](#decisions)).
 
 ## Versions and pins
 
@@ -197,39 +200,103 @@ Run to validate the harness, not as results:
   other GPUs or to whisper-base. Rows 2 and 6 will show it.
 - **The q8 decoder broke whisper-tiny.** q8/q8 on WASM looped ("the master of the master of…") on
   the first English window and on all the Hindi. The fp32 decoder didn't. So the WASM default
-  (`q8`) can't be trusted without measuring; row 4 checks this for base.
+  (`q8`) can't be trusted without measuring; row 4 checks this for base. _Update: in the real runs,
+  whisper-base q8/q8 on WASM never looped on English (4.4% WER). The loop was specific to tiny's
+  q8 decoder._
 - **whisper-tiny's Hindi is unusable** in every configuration tried (repetition loops). That's
   consistent with tiny's known weak Hindi. base and small are the candidates.
 - Greedy decoding has no protection against repetition loops. P3b should add Whisper's usual
   guards: a compression-ratio or `no_repeat_ngram_size` check, and re-decoding at higher
   temperature on failure.
 
-## Results (fill in from the bench)
+## Results
 
-Environment (paste from the bench's Markdown export):
+Run by hand with the bench on **Chrome 155 stable**, Windows, Intel gen-12lp (WebGPU hardware
+adapter, shader-f16), 12 CPU threads, not cross-origin isolated (single-threaded WASM).
 
-- Browser:
-- WebGPU in worker:
-- CPU threads:
-- crossOriginIsolated:
+| #   | Model | Device | Enc / Dec   | Load (s) | EN RTF 1st | EN RTF 2nd | EN WER | HI RTF | HI CER | HI WER | Detect EN / HI | Detect (ms) |
+| --- | ----- | ------ | ----------- | -------: | ---------: | ---------: | -----: | -----: | -----: | -----: | -------------- | ----------: |
+| 1   | base  | webgpu | fp32 / fp32 |    245.6 |      0.505 |      0.327 |   5.3% |  0.451 |  81.4% |  92.6% | en / hi        |        4380 |
+| 2   | base  | webgpu | fp32 / q4   |     90.6 |      0.403 |      0.309 |   4.4% |  1.019 | 135.0% |  94.4% | en / hi        |        3988 |
+| 3   | base  | webgpu | fp16 / fp16 |     95.5 |      0.290 |      0.188 |   5.3% |  0.215 |  80.7% |  91.7% | en / hi        |         692 |
+| 4   | base  | wasm   | q8 / q8     |     51.3 |      0.249 |      0.266 |   4.4% |  1.019 |  90.1% | 168.5% | en / hi        |        3189 |
+| 5   | tiny  | wasm   | fp32 / fp32 |    103.4 |      0.113 |      0.137 |   3.5% |  0.437 | 142.8% | 221.3% | en / hi        |        1772 |
+| 6   | small | webgpu | fp16 / fp16 |    323.5 |      1.042 |      0.781 |   2.7% |  1.659 |  64.3% | 134.3% | en / hi        |        2281 |
 
-| Model | Device | Enc / Dec | Load | Load (s) | EN RTF 1st | EN RTF 2nd | EN WER | HI RTF | HI CER | HI WER | Detect EN / HI | Detect (ms) | Peak tab mem (MB) | Peak GPU proc mem (MB) |
-| ----- | ------ | --------- | ---- | -------: | ---------: | ---------: | -----: | -----: | -----: | -----: | -------------- | ----------: | ----------------: | ---------------------: |
-|       |        |           |      |          |            |            |        |        |        |        |                |             |                   |                        |
+Load times scale with download size, so they're dominated by the first-run download over the
+tester's connection. Cached-load times weren't captured. Hindi CER/WER above 100% means the output
+was longer than the reference (repetition loops); see below.
 
-Hindi → English translation (raw outputs are in the bench's **Outputs**):
+**Peak memory** (Chrome Task Manager):
 
-| Model | Device | Enc / Dec | Adequacy (1–5) | Notes |
-| ----- | ------ | --------- | -------------: | ----- |
-|       |        |           |                |       |
+- Bench tab ("Extension: Tabscribe ASR bench"): about 1.3–1.44 GB on the whisper-base WebGPU rows
+  (1–3).
+- GPU Process: about 1.5 GB on row 2.
+- Not captured for the other rows.
 
-## Open questions for P3b
+**Hindi → English translation** (adequacy 1–5, judged against the FLoRes reference):
 
-- **Multithreaded WASM.** Extension pages aren't cross-origin isolated, so ORT falls back to one
-  thread. Setting `cross_origin_embedder_policy` / `cross_origin_opener_policy` in the manifest
-  could enable threads for the WASM fallback. That needs checking against our CORS model downloads
-  and the offscreen document.
-- **Default choice.** Pick (model, device, dtype) per the results above, plus a WASM fallback for
-  when `requestAdapter()` returns null or a fallback adapter.
-- **Streaming.** Feed the worklet → resampler → VAD → worker in overlapping windows. RTF from this
-  bench sets the window and overlap budget.
+| #   | Config                   | Adequacy | Notes                                                                                                              |
+| --- | ------------------------ | -------: | ------------------------------------------------------------------------------------------------------------------ |
+| 1   | base webgpu fp32 / fp32  |        1 | Repetition loops                                                                                                   |
+| 2   | base webgpu fp32 / q4    |        1 | Repetition loops                                                                                                   |
+| 3   | base webgpu fp16 / fp16  |        1 | Repetition loops                                                                                                   |
+| 4   | base wasm q8 / q8        |        1 | Repetition loops                                                                                                   |
+| 5   | tiny wasm fp32 / fp32    |        1 | Repetition loops                                                                                                   |
+| 6   | small webgpu fp16 / fp16 |        2 | No loop in the translation, and the first sentence is partly right. The Hindi transcript still loops ("ये ये ये"). |
+
+Examples of the loops in rows 1–5: "the kabut of the kabut", "a kind of a kind of", "the people of
+the people", "chach ke parisar on the paper".
+
+**Other observations:**
+
+- No `[Music]`-only output in any row, including the q4 decoder on WebGPU (row 2). The reported
+  Windows issue doesn't reproduce on this Intel GPU. It may still appear on other GPU vendors.
+- English never looped in any row, including base q8/q8 on WASM.
+- fp16/fp16 (row 3) is the fastest WebGPU configuration on this GPU (EN RTF 0.188 warm), with half
+  the download of fp32/fp32. Its language detection is also much faster (692 ms, against 3–4 s
+  elsewhere).
+- First-run RTF is higher than second-run RTF on WebGPU (shader compilation and warm-up). P3b
+  should warm the model up once after loading, before live audio arrives.
+
+### Caveats
+
+- **The fixtures are single, short, clean clips:** 47.7 s of read English from one speaker, and
+  50.7 s of read Hindi. On about 105 reference words, one word is about 1% WER. So the English
+  spread (2.7–5.3%) is within noise, and doesn't rank the configurations. The clips are good enough
+  to catch breakage (loops, `[Music]`, wrong language) and to compare speed, not to compare
+  accuracy. P3b adds a longer, realistic English regression fixture.
+- RTF is from one run per configuration on one machine. Treat differences under about 20% as noise.
+- **ONNX Runtime is a nightly.** Transformers.js 4.3.1 pins `onnxruntime-web`
+  `1.31.0-dev.20260914-8d85527a0`, a dev build rather than a stable ORT release. A future
+  Transformers.js or ORT bump can change numerics or WebGPU kernels (for example the reported q4
+  overflow), so any bump must re-run this bench, at least rows 3 and 4. The exact pins and the
+  14-day rule keep it from changing silently.
+
+## Decisions
+
+1. **Default: whisper-base, WebGPU, fp16 / fp16.** It's the fastest WebGPU configuration measured
+   (warm EN RTF 0.188, HI RTF 0.215), a 148.8 MB download, and has the fastest language detection.
+   Its English accuracy matches fp32/fp32 within noise.
+2. **Fallback: whisper-base, WASM, q8 / q8**, when there's no WebGPU adapter or only a fallback
+   (software) adapter. EN RTF 0.25–0.27 single-threaded, a 79.7 MB download, and no English loops.
+3. **Not tiny.** Its better WER (3.5%) is within noise on one 48 s clip, and keeping one model means
+   one download and one set of behaviours to test.
+4. **whisper-small rejected for live captions.** EN RTF 0.78–1.04 leaves no headroom for real time
+   on this machine, and the download is 488 MB.
+5. **English-first: Hindi isn't shippable on-device yet.** Every configuration loops on Hindi
+   transcription, and translation adequacy is 1–2 out of 5. P3b ships English. The README makes no
+   Hindi or translation promise until it passes this bench. Hindi gets its own spike (P3c).
+
+## Next
+
+- **P3b (live English captions):** streaming pipeline with repetition guards, built on the
+  decisions above. Plan agreed before coding.
+- **P3c (Hindi spike, after P3b):**
+  - Re-run Hindi with the P3b repetition guards on base fp16 and small fp16.
+  - Survey openly licensed Hindi fine-tuned Whisper models (base/small) that have ONNX weights or
+    can be converted. Report licence, size and revision.
+  - Plan B: Hindi through the P6 opt-in bring-your-own-key cloud mode.
+- **Multithreaded WASM:** extension pages aren't cross-origin isolated, so the WASM fallback runs
+  single-threaded. Setting `cross_origin_embedder_policy` / `cross_origin_opener_policy` could
+  enable threads. Evaluate it against our CORS model downloads before relying on it.
