@@ -1,0 +1,523 @@
+// Dev-only ASR benchmark. Spawns the production ASR worker, runs the fixtures through it and
+// reports load time, real-time factor and accuracy per (model, device, dtype). Results are kept in
+// localStorage so a page reload (for a cold worker with a warm cache) doesn't lose them.
+import {
+  DEVICES,
+  downloadBytes,
+  DTYPES,
+  isDevice,
+  isDtype,
+  isModelKey,
+  MODEL_KEYS,
+  MODELS,
+  modelFileUrls,
+  type Device,
+  type DtypeSpec,
+  type ModelKey,
+} from '../asr/models';
+import {
+  isWorkerResponse,
+  type AsrTask,
+  type GpuInfo,
+  type WorkerRequest,
+  type WorkerResponse,
+} from '../asr/protocol';
+import { ASR_SAMPLE_RATE, resampleTo16k } from '../asr/resample';
+import { FIXTURES, type Fixture } from './fixtures';
+import { characterErrorRate, wordErrorRate } from './metrics';
+
+/** Cache API bucket Transformers.js stores model files in. */
+const MODEL_CACHE = 'transformers-cache';
+/** Fixtures are decoded at a typical tab-capture rate and resampled like live audio will be. */
+const CAPTURE_RATE = 48_000;
+const RESULTS_KEY = 'tabscribe-bench-results';
+
+interface BenchRow {
+  model: ModelKey;
+  device: Device;
+  dtype: DtypeSpec;
+  cachedBeforeLoad: boolean;
+  loadMs: number;
+  enRtfFirst: number;
+  enRtfSecond: number;
+  enWer: number;
+  hiRtf: number;
+  hiCer: number;
+  hiWer: number;
+  detectedEn: string;
+  detectedHi: string;
+  detectMs: number;
+  outputs: { en: string; hi: string; hiTranslate: string };
+}
+
+function element<T extends HTMLElement>(id: string, type: new () => T): T {
+  const found = document.getElementById(id);
+  if (!(found instanceof type)) throw new Error(`#${id} missing`);
+  return found;
+}
+
+const ui = {
+  environment: element('environment', HTMLElement),
+  model: element('model', HTMLSelectElement),
+  device: element('device', HTMLSelectElement),
+  encoder: element('encoder', HTMLSelectElement),
+  decoder: element('decoder', HTMLSelectElement),
+  size: element('size', HTMLElement),
+  load: element('load', HTMLButtonElement),
+  run: element('run', HTMLButtonElement),
+  unload: element('unload', HTMLButtonElement),
+  clearCache: element('clear-cache', HTMLButtonElement),
+  progress: element('progress', HTMLElement),
+  error: element('error', HTMLElement),
+  copy: element('copy', HTMLButtonElement),
+  clearResults: element('clear-results', HTMLButtonElement),
+  results: element('results', HTMLElement),
+  outputs: element('outputs', HTMLElement),
+};
+
+// --- Worker client ------------------------------------------------------------------------------
+
+const worker = new Worker(new URL('../asr/asr.worker.ts', import.meta.url), { type: 'module' });
+let nextId = 0;
+const pending = new Map<
+  number,
+  { resolve: (response: WorkerResponse) => void; reject: (error: Error) => void }
+>();
+const fileProgress = new Map<string, { loaded: number; total: number }>();
+
+worker.addEventListener('message', (event: MessageEvent<unknown>) => {
+  const response = event.data;
+  if (!isWorkerResponse(response)) return;
+  if (response.type === 'progress') {
+    fileProgress.set(response.file, { loaded: response.loaded, total: response.total });
+    let loaded = 0;
+    let total = 0;
+    for (const file of fileProgress.values()) {
+      loaded += file.loaded;
+      total += file.total;
+    }
+    ui.progress.textContent = `Downloading ${mb(loaded)} / ${mb(total)} (${response.file})`;
+    return;
+  }
+  const waiter = pending.get(response.id);
+  pending.delete(response.id);
+  if (response.type === 'error') waiter?.reject(new Error(response.message));
+  else waiter?.resolve(response);
+});
+worker.addEventListener('error', (event) => {
+  showError(`Worker error: ${event.message}`);
+});
+
+function send<T extends WorkerResponse['type']>(
+  expected: T,
+  make: (id: number) => WorkerRequest,
+  transfer: Transferable[] = [],
+): Promise<Extract<WorkerResponse, { type: T }>> {
+  const id = nextId++;
+  return new Promise((resolve, reject) => {
+    pending.set(id, {
+      resolve: (response) => {
+        if (response.type === expected) resolve(response as Extract<WorkerResponse, { type: T }>);
+        else reject(new Error(`Expected ${expected}, got ${response.type}`));
+      },
+      reject,
+    });
+    worker.postMessage(make(id), transfer);
+  });
+}
+
+async function transcribe(audio: Float32Array, task: AsrTask, language: string | null) {
+  const copy = audio.slice();
+  return send('result', (id) => ({ type: 'transcribe', id, audio: copy, task, language }), [
+    copy.buffer,
+  ]);
+}
+
+// --- Helpers ------------------------------------------------------------------------------------
+
+const mb = (bytes: number): string => `${(bytes / 1e6).toFixed(1)} MB`;
+const pct = (rate: number): string => `${(rate * 100).toFixed(1)}%`;
+const rtf = (ms: number, samples: number): number => ms / 1000 / (samples / ASR_SAMPLE_RATE);
+
+function showError(message: string): void {
+  ui.error.textContent = message;
+}
+
+function setBusy(busy: boolean, loaded = currentModel !== null): void {
+  ui.load.disabled = busy;
+  ui.run.disabled = busy || !loaded;
+  ui.unload.disabled = busy || !loaded;
+  ui.clearCache.disabled = busy;
+  for (const select of [ui.model, ui.device, ui.encoder, ui.decoder]) select.disabled = busy;
+}
+
+function selected(): { model: ModelKey; device: Device; dtype: DtypeSpec } {
+  const { value: model } = ui.model;
+  const { value: device } = ui.device;
+  const { value: encoder } = ui.encoder;
+  const { value: decoder } = ui.decoder;
+  if (!isModelKey(model) || !isDevice(device) || !isDtype(encoder) || !isDtype(decoder)) {
+    throw new Error('Invalid selection');
+  }
+  return { model, device, dtype: { encoder, decoder } };
+}
+
+async function cachedFlags(urls: string[]): Promise<boolean[]> {
+  try {
+    const cache = await caches.open(MODEL_CACHE);
+    return await Promise.all(urls.map(async (url) => (await cache.match(url)) !== undefined));
+  } catch {
+    return urls.map(() => false);
+  }
+}
+
+// --- Fixtures -----------------------------------------------------------------------------------
+
+const decoded = new Map<Fixture['key'], Float32Array>();
+
+/** Decodes at 48 kHz (as tab capture delivers it), then resamples with our resampler. */
+async function fixtureAudio(fixture: Fixture): Promise<Float32Array> {
+  const cached = decoded.get(fixture.key);
+  if (cached) return cached;
+  const bytes = await (await fetch(fixture.url)).arrayBuffer();
+  const context = new OfflineAudioContext({
+    numberOfChannels: 1,
+    length: 1,
+    sampleRate: CAPTURE_RATE,
+  });
+  const buffer = await context.decodeAudioData(bytes);
+  const channels = Array.from({ length: buffer.numberOfChannels }, (_, i) =>
+    buffer.getChannelData(i),
+  );
+  const audio = resampleTo16k(channels, buffer.sampleRate);
+  decoded.set(fixture.key, audio);
+  return audio;
+}
+
+function fixture(key: Fixture['key']): Fixture {
+  const found = FIXTURES.find((candidate) => candidate.key === key);
+  if (!found) throw new Error(`Missing fixture ${key}`);
+  return found;
+}
+
+// --- Results ------------------------------------------------------------------------------------
+
+function loadRows(): BenchRow[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(RESULTS_KEY) ?? '[]');
+    return Array.isArray(parsed) ? (parsed as BenchRow[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+const rows = loadRows();
+
+function saveRows(): void {
+  try {
+    localStorage.setItem(RESULTS_KEY, JSON.stringify(rows));
+  } catch {
+    // Results stay on screen; only persistence across reloads is lost.
+  }
+}
+
+const label = (row: BenchRow): string =>
+  `${row.model} · ${row.device} · ${row.dtype.encoder}/${row.dtype.decoder}`;
+
+function cells(row: BenchRow): string[] {
+  return [
+    row.model,
+    row.device,
+    `${row.dtype.encoder} / ${row.dtype.decoder}`,
+    row.cachedBeforeLoad ? 'cached' : 'download',
+    (row.loadMs / 1000).toFixed(1),
+    row.enRtfFirst.toFixed(3),
+    row.enRtfSecond.toFixed(3),
+    pct(row.enWer),
+    row.hiRtf.toFixed(3),
+    pct(row.hiCer),
+    pct(row.hiWer),
+    `${row.detectedEn} / ${row.detectedHi}`,
+    row.detectMs.toFixed(0),
+  ];
+}
+
+function renderRows(): void {
+  ui.results.replaceChildren(
+    ...rows.map((row) => {
+      const tr = document.createElement('tr');
+      for (const text of cells(row)) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.append(td);
+      }
+      return tr;
+    }),
+  );
+  const translationReference = fixture('hi').translationReference ?? '';
+  ui.outputs.replaceChildren(
+    ...rows.map((row) => {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = `Outputs: ${label(row)}`;
+      details.append(summary);
+      for (const [title, text] of [
+        ['English transcript', row.outputs.en],
+        ['Hindi transcript', row.outputs.hi],
+        ['Hindi → English translation', row.outputs.hiTranslate],
+        ['Reference translation (FLoRes)', translationReference],
+      ] as const) {
+        const heading = document.createElement('h3');
+        heading.textContent = title;
+        const body = document.createElement('p');
+        body.textContent = text;
+        details.append(heading, body);
+      }
+      return details;
+    }),
+  );
+}
+
+// --- Environment --------------------------------------------------------------------------------
+
+let gpu: GpuInfo | null = null;
+
+function environment(): [string, string][] {
+  const gpuText = !gpu
+    ? 'checking…'
+    : gpu.available
+      ? [
+          `${gpu.vendor} ${gpu.architecture} ${gpu.device} ${gpu.description}`.trim() ||
+            '(no info)',
+          gpu.isFallbackAdapter ? 'FALLBACK adapter' : 'hardware adapter',
+          `shader-f16 ${gpu.shaderF16 ? 'yes' : 'no'}`,
+          `maxBufferSize ${mb(gpu.maxBufferSize)}`,
+          `maxStorageBufferBindingSize ${mb(gpu.maxStorageBufferBindingSize)}`,
+        ].join(' · ')
+      : `unavailable (${gpu.reason})`;
+  return [
+    ['Browser', navigator.userAgent],
+    ['WebGPU in worker', gpuText],
+    ['CPU threads', String(navigator.hardwareConcurrency)],
+    ['crossOriginIsolated', `${String(self.crossOriginIsolated)} (false = single-threaded WASM)`],
+  ];
+}
+
+function renderEnvironment(): void {
+  ui.environment.replaceChildren(
+    ...environment().flatMap(([term, value]) => {
+      const dt = document.createElement('dt');
+      dt.textContent = term;
+      const dd = document.createElement('dd');
+      dd.textContent = value;
+      return [dt, dd];
+    }),
+  );
+}
+
+function markdown(): string {
+  const header = [
+    'Model', 'Device', 'Enc / Dec', 'Load', 'Load (s)', 'EN RTF 1st', 'EN RTF 2nd', 'EN WER',
+    'HI RTF', 'HI CER', 'HI WER', 'Detect EN / HI', 'Detect (ms)',
+  ]; // prettier-ignore
+  const line = (values: string[]) => `| ${values.join(' | ')} |`;
+  return [
+    '### Environment',
+    ...environment().map(([term, value]) => `- ${term}: ${value}`),
+    '',
+    '### Results',
+    line(header),
+    line(header.map(() => '---')),
+    ...rows.map((row) => line(cells(row))),
+    '',
+    '### Outputs',
+    ...rows.flatMap((row) => [
+      '',
+      `#### ${label(row)}`,
+      `- EN: ${row.outputs.en}`,
+      `- HI: ${row.outputs.hi}`,
+      `- HI→EN: ${row.outputs.hiTranslate}`,
+    ]),
+  ].join('\n');
+}
+
+// --- Actions ------------------------------------------------------------------------------------
+
+let currentModel: { model: ModelKey; device: Device; dtype: DtypeSpec; loadMs: number; cachedBeforeLoad: boolean } | null = null; // prettier-ignore
+
+async function updateSize(): Promise<void> {
+  const { model, dtype } = selected();
+  const urls = modelFileUrls(model, dtype);
+  const flags = await cachedFlags(urls);
+  const cachedCount = flags.filter(Boolean).length;
+  const total = downloadBytes(model, dtype);
+  const revision = MODELS[model].revision.slice(0, 7);
+  if (cachedCount === urls.length) {
+    ui.size.textContent = `All ${String(urls.length)} files cached (${mb(total)}), revision ${revision}. Loading downloads nothing.`;
+    ui.load.textContent = 'Load model (from cache)';
+  } else {
+    ui.size.textContent = `Download: up to ${mb(total)} from huggingface.co (${String(cachedCount)} of ${String(urls.length)} files already cached), revision ${revision}.`;
+    ui.load.textContent = `Load model (downloads up to ${mb(total)})`;
+  }
+}
+
+async function loadModel(): Promise<void> {
+  const choice = selected();
+  showError('');
+  setBusy(true, false);
+  fileProgress.clear();
+  try {
+    const cachedBeforeLoad = (await cachedFlags(modelFileUrls(choice.model, choice.dtype))).every(
+      Boolean,
+    );
+    ui.progress.textContent = cachedBeforeLoad ? 'Loading from cache…' : 'Starting download…';
+    currentModel = null;
+    const { ms } = await send('loaded', (id) => ({ type: 'load', id, ...choice }));
+    currentModel = { ...choice, loadMs: ms, cachedBeforeLoad };
+    ui.progress.textContent = `Loaded ${choice.model} on ${choice.device} in ${(ms / 1000).toFixed(1)} s.`;
+  } catch (error) {
+    showError(String(error));
+    ui.progress.textContent = '';
+  } finally {
+    setBusy(false);
+    void updateSize();
+  }
+}
+
+async function runBenchmark(): Promise<void> {
+  const loaded = currentModel;
+  if (!loaded) return;
+  showError('');
+  setBusy(true);
+  try {
+    ui.progress.textContent = 'Decoding fixtures…';
+    const en = fixture('en');
+    const hi = fixture('hi');
+    const enAudio = await fixtureAudio(en);
+    const hiAudio = await fixtureAudio(hi);
+    const steps = 6;
+    const step = async (n: number, name: string, run: () => ReturnType<typeof transcribe>) => {
+      ui.progress.textContent = `Running ${String(n)}/${String(steps)}: ${name}…`;
+      return run();
+    };
+    const enFirst = await step(1, 'English, forced en (first run)', () =>
+      transcribe(enAudio, 'transcribe', 'en'),
+    );
+    const enSecond = await step(2, 'English, forced en (second run)', () =>
+      transcribe(enAudio, 'transcribe', 'en'),
+    );
+    const enDetect = await step(3, 'English, auto-detect', () =>
+      transcribe(enAudio, 'transcribe', null),
+    );
+    const hiForced = await step(4, 'Hindi, forced hi', () =>
+      transcribe(hiAudio, 'transcribe', 'hi'),
+    );
+    const hiDetect = await step(5, 'Hindi, auto-detect', () =>
+      transcribe(hiAudio, 'transcribe', null),
+    );
+    const hiTranslate = await step(6, 'Hindi → English translate', () =>
+      transcribe(hiAudio, 'translate', 'hi'),
+    );
+    const row: BenchRow = {
+      model: loaded.model,
+      device: loaded.device,
+      dtype: loaded.dtype,
+      cachedBeforeLoad: loaded.cachedBeforeLoad,
+      loadMs: loaded.loadMs,
+      enRtfFirst: rtf(enFirst.ms, enAudio.length),
+      enRtfSecond: rtf(enSecond.ms, enAudio.length),
+      enWer: wordErrorRate(en.reference, enSecond.text, 'en').rate,
+      hiRtf: rtf(hiForced.ms, hiAudio.length),
+      hiCer: characterErrorRate(hi.reference, hiForced.text, 'hi').rate,
+      hiWer: wordErrorRate(hi.reference, hiForced.text, 'hi').rate,
+      detectedEn: enDetect.language,
+      detectedHi: hiDetect.language,
+      detectMs: ((enDetect.detectMs ?? 0) + (hiDetect.detectMs ?? 0)) / 2,
+      outputs: { en: enSecond.text, hi: hiForced.text, hiTranslate: hiTranslate.text },
+    };
+    rows.push(row);
+    saveRows();
+    renderRows();
+    ui.progress.textContent = `Done: ${label(row)}.`;
+  } catch (error) {
+    showError(String(error));
+    ui.progress.textContent = '';
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function unloadModel(): Promise<void> {
+  setBusy(true);
+  try {
+    await send('unloaded', (id) => ({ type: 'unload', id }));
+    currentModel = null;
+    ui.progress.textContent = 'Unloaded.';
+  } catch (error) {
+    showError(String(error));
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function clearModelCache(): Promise<void> {
+  if (!confirm('Delete every cached model file? The next load downloads again.')) return;
+  await caches.delete(MODEL_CACHE);
+  ui.progress.textContent = 'Model cache cleared.';
+  await updateSize();
+}
+
+// --- Wiring -------------------------------------------------------------------------------------
+
+function fillSelect(select: HTMLSelectElement, values: readonly string[], initial: string): void {
+  select.replaceChildren(
+    ...values.map((value) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      return option;
+    }),
+  );
+  select.value = initial;
+}
+
+fillSelect(ui.model, MODEL_KEYS, 'whisper-base');
+fillSelect(ui.device, DEVICES, 'webgpu');
+fillSelect(ui.encoder, DTYPES, 'fp32');
+fillSelect(ui.decoder, DTYPES, 'q4');
+
+for (const select of [ui.model, ui.device, ui.encoder, ui.decoder]) {
+  select.addEventListener('change', () => void updateSize());
+}
+ui.load.addEventListener('click', () => void loadModel());
+ui.run.addEventListener('click', () => void runBenchmark());
+ui.unload.addEventListener('click', () => void unloadModel());
+ui.clearCache.addEventListener('click', () => void clearModelCache());
+ui.copy.addEventListener('click', () => {
+  void navigator.clipboard.writeText(markdown()).then(
+    () => (ui.progress.textContent = 'Results copied as Markdown.'),
+    (error: unknown) => {
+      showError(`Copy failed: ${String(error)}`);
+    },
+  );
+});
+ui.clearResults.addEventListener('click', () => {
+  rows.length = 0;
+  saveRows();
+  renderRows();
+});
+
+renderEnvironment();
+renderRows();
+setBusy(false);
+void updateSize();
+void send('gpu-info', (id) => ({ type: 'gpu-info', id })).then(
+  (response) => {
+    gpu = response.info;
+    renderEnvironment();
+  },
+  (error: unknown) => {
+    gpu = { available: false, reason: String(error) };
+    renderEnvironment();
+  },
+);

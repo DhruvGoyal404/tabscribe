@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tabscribe ASR bench</title>
+    <link rel="stylesheet" href="./bench.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Tabscribe ASR bench</h1>
+      <p class="note">
+        Dev-only page (built by <code>npm run build:bench</code>, never in the production build).
+        Runs the bundled fixtures through the same ASR worker the extension will use. Nothing is
+        downloaded until you press <strong>Load model</strong>.
+      </p>
+    </header>
+
+    <section aria-labelledby="env-heading">
+      <h2 id="env-heading">Environment</h2>
+      <dl id="environment"></dl>
+    </section>
+
+    <section aria-labelledby="config-heading">
+      <h2 id="config-heading">Configuration</h2>
+      <div class="controls">
+        <label
+          >Model
+          <select id="model"></select
+        ></label>
+        <label
+          >Device
+          <select id="device"></select
+        ></label>
+        <label
+          >Encoder dtype
+          <select id="encoder"></select
+        ></label>
+        <label
+          >Decoder dtype
+          <select id="decoder"></select
+        ></label>
+      </div>
+      <p id="size" role="status"></p>
+      <div class="buttons">
+        <button id="load" type="button">Load model</button>
+        <button id="run" type="button" disabled>Run benchmark</button>
+        <button id="unload" type="button" disabled>Unload</button>
+        <button id="clear-cache" type="button">Clear model cache</button>
+      </div>
+      <p id="progress" role="status" aria-live="polite"></p>
+      <p id="error" role="alert"></p>
+    </section>
+
+    <section aria-labelledby="results-heading">
+      <h2 id="results-heading">Results</h2>
+      <div class="buttons">
+        <button id="copy" type="button">Copy results as Markdown</button>
+        <button id="clear-results" type="button">Clear results</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th>Device</th>
+              <th>Enc / Dec</th>
+              <th>Load</th>
+              <th>Load (s)</th>
+              <th>EN RTF 1st</th>
+              <th>EN RTF 2nd</th>
+              <th>EN WER</th>
+              <th>HI RTF</th>
+              <th>HI CER</th>
+              <th>HI WER</th>
+              <th>Detect EN / HI</th>
+              <th>Detect (ms)</th>
+            </tr>
+          </thead>
+          <tbody id="results"></tbody>
+        </table>
+      </div>
+      <div id="outputs"></div>
+    </section>
+
+    <script type="module" src="./bench.ts"></script>
+  </body>
+</html>
