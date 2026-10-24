@@ -179,8 +179,13 @@ async function main() {
   log(
     '1 control reply:',
     JSON.stringify(
+      // What Start does first (since P3b the popup requests the stream id).
       await plain.evaluate(
-        (id) => chrome.runtime.sendMessage({ type: 'capture/start', tabId: id }),
+        (id) =>
+          chrome.tabCapture.getMediaStreamId({ targetTabId: id }).then(
+            () => 'stream id issued',
+            (error) => String(error),
+          ),
         a.tabId,
       ),
     ),
@@ -188,7 +193,7 @@ async function main() {
   await plain.evaluate(() => chrome.runtime.sendMessage({ type: 'capture/stop' }));
   await plain.close();
 
-  // 2. Gesture: popup opened by the action, Start clicked; SW calls getMediaStreamId.
+  // 2. Gesture: popup opened by the action, Start clicked; the popup calls getMediaStreamId.
   await a.page.bringToFront();
   let popup = await openPopup(a.page);
   log('2 popup before start:', await popup.text('status'));

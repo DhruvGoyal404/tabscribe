@@ -98,15 +98,13 @@ async function teardown(): Promise<void> {
 
 // --- Capture lifecycle --------------------------------------------------------------------------
 
-async function startCapture(tabId: number): Promise<void> {
+async function startCapture(tabId: number, streamId: string): Promise<void> {
   const current = await readState();
   if (current.status === 'capturing' && current.tabId === tabId) return;
   if (current.status !== 'idle' && current.status !== 'error') await stopCapture();
 
   await dispatch({ type: 'start', tabId });
   try {
-    // Allowed because opening the popup invoked the extension on this tab (an activeTab grant).
-    const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
     // mutedInfo isn't one of the fields gated by the "tabs" permission. Later changes arrive via
     // tabs.onUpdated, queued behind this start.
     const { mutedInfo } = await chrome.tabs.get(tabId);
@@ -148,7 +146,9 @@ chrome.runtime.onMessage.addListener(
     if (sender.id !== chrome.runtime.id || !isMessage(message)) return false;
     switch (message.type) {
       case 'capture/start':
-        void settle(serialize(() => startCapture(message.tabId))).then(sendResponse);
+        void settle(serialize(() => startCapture(message.tabId, message.streamId))).then(
+          sendResponse,
+        );
         return true;
       case 'capture/stop':
         void settle(serialize(stopCapture)).then(sendResponse);

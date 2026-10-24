@@ -13,7 +13,7 @@ export default defineManifest({
   name: 'Tabscribe',
   version: pkg.version,
   description: pkg.description,
-  // tabCapture.getMediaStreamId from the service worker needs Chrome 116+.
+  // chrome.runtime.getContexts (finding the offscreen document) needs Chrome 116+.
   minimum_chrome_version: '116',
   icons,
   action: {
