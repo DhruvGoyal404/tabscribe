@@ -20,6 +20,7 @@ import {
   type ProgressInfo,
 } from '@huggingface/transformers';
 import ortWasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url';
+import { skipPaddingFrames, type WhisperFeatureExtractorLike } from './features';
 import { HF_HOST, MODELS } from './models';
 import {
   isWorkerRequest,
@@ -107,6 +108,7 @@ async function load(request: Extract<WorkerRequest, { type: 'load' }>): Promise<
     },
   });
   allowPrecomputedEncoderOutput(asr);
+  skipPaddingFrames(asr.processor.feature_extractor as unknown as WhisperFeatureExtractorLike);
   post({ type: 'loaded', id: request.id, ms: performance.now() - started, threads });
 }
 
