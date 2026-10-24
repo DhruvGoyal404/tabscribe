@@ -10,9 +10,9 @@ are fixed below and need a re-test on Chrome stable.
 ## Architecture
 
 ```text
-popup ──capture/start {tabId}──▶ service worker
-                                  │ tabCapture.getMediaStreamId({ targetTabId })
-                                  │ tabs.get(tabId).mutedInfo
+popup ──capture/start {tabId, streamId}──▶ service worker
+  tabCapture.getMediaStreamId      │ tabs.get(tabId).mutedInfo
+  ({ targetTabId }), since P3b     │
                                   │ offscreen.createDocument(USER_MEDIA), one shared in-flight promise
                                   ▼
                            offscreen document ◀── offscreen/start {streamId, muted}
@@ -55,6 +55,12 @@ The worklet has its own `tsconfig.json` (no DOM lib) and minimal AudioWorkletGlo
 declarations, so DOM APIs can't leak into code running on the audio thread.
 
 ## Finding: the user-gesture question
+
+> **Changed in P3b:** the popup now requests the stream id and sends it with `capture/start`. Once
+> the extension became cross-origin isolated (for multithreaded ASR), an id issued by the service
+> worker, which isn't isolated, fails in the isolated offscreen document with `AbortError: Error
+starting tab capture`. See [p3b-streaming.md](./p3b-streaming.md#cross-origin-isolation-multithreaded-wasm). The
+> activeTab finding below still holds: the popup is the invoked context.
 
 **`chrome.tabCapture.getMediaStreamId({ targetTabId })` called in the service worker, after a message
 from the popup, works.** No popup-side fallback is needed.
