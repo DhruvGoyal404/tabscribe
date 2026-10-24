@@ -732,10 +732,9 @@ async function loadInto(
   );
   ui.progress.textContent = cachedBeforeLoad ? 'Loading from cache…' : 'Starting download…';
   currentModel = null;
-  if (workerThreads !== null && workerThreads !== effectiveThreads(requested)) {
-    restartWorker();
-    workerThreads = null;
-  }
+  if (workerThreads !== null && workerThreads !== effectiveThreads(requested)) restartWorker();
+  // ORT fixes the count as soon as the worker starts loading, even if the load then fails.
+  workerThreads = effectiveThreads(requested);
   const { ms, threads } = await send('loaded', (id) => ({
     type: 'load',
     id,
@@ -764,12 +763,23 @@ async function loadModel(): Promise<void> {
   }
 }
 
+/** The loaded model on the selected thread count: reloaded from cache if the selection changed. */
+async function withSelectedThreads(
+  loaded: NonNullable<typeof currentModel>,
+): Promise<NonNullable<typeof currentModel>> {
+  const requested = selectedThreads();
+  if (effectiveThreads(requested) === loaded.threads) return loaded;
+  const { model, device, dtype } = loaded;
+  return loadInto({ model, device, dtype }, requested);
+}
+
 async function runBenchmark(): Promise<void> {
-  const loaded = currentModel;
-  if (!loaded) return;
+  const current = currentModel;
+  if (!current) return;
   showError('');
   setBusy(true);
   try {
+    const loaded = await withSelectedThreads(current);
     ui.progress.textContent = 'Decoding fixtures…';
     const en = fixture('en');
     const hi = fixture('hi');
@@ -834,11 +844,7 @@ async function profileCalls(): Promise<void> {
   showError('');
   setBusy(true);
   try {
-    const requested = selectedThreads();
-    if (effectiveThreads(requested) !== loaded.threads) {
-      const { model, device, dtype } = loaded;
-      loaded = await loadInto({ model, device, dtype }, requested);
-    }
+    loaded = await withSelectedThreads(loaded);
     const audio = await fixtureAudio(fixture('en'));
     const profileOne = (segment: Float32Array) => {
       const copy = segment.slice();
