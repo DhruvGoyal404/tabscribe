@@ -4,5 +4,5 @@
     "lib": ["ES2023"],
     "types": []
   },
-  "include": ["**/*.ts", "../shared/level.ts"]
+  "include": ["**/*.ts", "../shared/level.ts", "../shared/chunker.ts"]
 }

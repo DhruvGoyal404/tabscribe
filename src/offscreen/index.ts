@@ -1,6 +1,6 @@
 // Offscreen document (reason USER_MEDIA). Turns a tab stream id into audio: plays it back so the
 // tab stays audible, and taps it with the level-meter worklet. Only chrome.runtime is available here.
-import workletUrl from '../worklet/level-meter.worklet.ts?worker&url';
+import workletUrl from '../worklet/capture.worklet.ts?worker&url';
 import { LEVEL_METER_PROCESSOR } from '../shared/level';
 import {
   isLevel,
