@@ -3,8 +3,14 @@
 
 declare const sampleRate: number;
 
+/** The parts of MessagePort the processors use: their node's port, and ports sent over it. */
+interface WorkletPort {
+  postMessage(message: unknown, transfer?: unknown[]): void;
+  onmessage: ((event: { data: unknown }) => void) | null;
+}
+
 declare abstract class AudioWorkletProcessor {
-  readonly port: { postMessage(message: unknown): void };
+  readonly port: WorkletPort;
   process(
     inputs: Float32Array[][],
     outputs: Float32Array[][],
