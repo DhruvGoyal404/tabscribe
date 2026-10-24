@@ -8,6 +8,15 @@ const icons = {
   128: 'icons/icon-128.png',
 };
 
+// Cross-origin isolation gives our pages and workers SharedArrayBuffer, which ONNX Runtime needs for
+// multithreaded WASM. The Hugging Face downloads still work under require-corp: they're CORS
+// fetches, and a CORS response satisfies COEP without a Cross-Origin-Resource-Policy header.
+// (Spread in because @crxjs's manifest type predates these keys, added in Chrome 93.)
+const isolation = {
+  cross_origin_embedder_policy: { value: 'require-corp' },
+  cross_origin_opener_policy: { value: 'same-origin' },
+};
+
 export default defineManifest({
   manifest_version: 3,
   name: 'Tabscribe',
@@ -42,4 +51,5 @@ export default defineManifest({
       .join('; ')
       .concat(';'),
   },
+  ...isolation,
 });

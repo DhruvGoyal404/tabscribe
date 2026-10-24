@@ -21,3 +21,15 @@ test('popup renders the idle state', async ({ context, extensionId }) => {
   await expect(page.getByRole('alert')).toBeHidden();
   await expect(page.getByText(/^v\d+\.\d+\.\d+$/)).toBeVisible();
 });
+
+// ONNX Runtime needs SharedArrayBuffer for multithreaded WASM. The manifest's COOP/COEP keys make
+// every extension page cross-origin isolated; its workers inherit that (checked in the bench).
+for (const page of ['popup', 'options']) {
+  test(`the ${page} page is cross-origin isolated`, async ({ context, extensionId }) => {
+    const tab = await context.newPage();
+    await tab.goto(`chrome-extension://${extensionId}/src/${page}/index.html`);
+    // A string, as e2e/ has no DOM types.
+    expect(await tab.evaluate<boolean>('self.crossOriginIsolated')).toBe(true);
+    expect(await tab.evaluate<string>('typeof SharedArrayBuffer')).toBe('function');
+  });
+}
