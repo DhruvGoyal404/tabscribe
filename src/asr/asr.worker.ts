@@ -8,6 +8,10 @@
 // - The ONNX Runtime WebAssembly binary is bundled with the extension. Transformers.js would
 //   otherwise point ORT at jsDelivr, so wasmPaths is set before any session is created.
 // - Model files are cached with the Cache API (`transformers-cache`), keyed by their pinned URL.
+//
+// Threads: when the extension is cross-origin isolated, ORT's WASM backend starts its pthreads as
+// module workers from this same script (import.meta.url) named "em-pthread". Those copies only run
+// ORT's thread loop, so they skip this worker's message handler.
 import {
   env,
   pipeline,
@@ -46,6 +50,22 @@ const post = (message: WorkerResponse): void => {
 };
 
 let asr: AutomaticSpeechRecognitionPipeline | null = null;
+/** ORT fixes its thread count when its WASM module starts, at this worker's first load. */
+let ortThreads: number | null = null;
+
+function startOrtWith(requested: number): number {
+  // Without SharedArrayBuffer ORT runs on one thread whatever it's asked for.
+  const threads = self.crossOriginIsolated ? requested : 1;
+  if (ortThreads === null) {
+    if (onnxWasm) onnxWasm.numThreads = threads;
+    ortThreads = threads;
+  } else if (ortThreads !== threads) {
+    throw new Error(
+      `ONNX Runtime already runs on ${String(ortThreads)} thread(s) in this worker; start a new worker for ${String(threads)}`,
+    );
+  }
+  return threads;
+}
 
 async function gpuInfo(): Promise<GpuInfo> {
   if (!('gpu' in navigator)) return { available: false, reason: 'navigator.gpu is undefined' };
@@ -67,6 +87,7 @@ async function gpuInfo(): Promise<GpuInfo> {
 
 async function load(request: Extract<WorkerRequest, { type: 'load' }>): Promise<void> {
   await unload();
+  const threads = startOrtWith(request.threads);
   const { id, revision } = MODELS[request.model];
   const started = performance.now();
   asr = await pipeline('automatic-speech-recognition', id, {
@@ -86,7 +107,7 @@ async function load(request: Extract<WorkerRequest, { type: 'load' }>): Promise<
     },
   });
   allowPrecomputedEncoderOutput(asr);
-  post({ type: 'loaded', id: request.id, ms: performance.now() - started });
+  post({ type: 'loaded', id: request.id, ms: performance.now() - started, threads });
 }
 
 /**
@@ -251,7 +272,7 @@ async function handle(request: WorkerRequest): Promise<void> {
 // One request at a time: loads and inference share the GPU and the ORT sessions.
 let queue: Promise<void> = Promise.resolve();
 
-self.addEventListener('message', (event: MessageEvent<unknown>) => {
+function onRequest(event: MessageEvent<unknown>): void {
   const request = event.data;
   if (!isWorkerRequest(request)) {
     console.warn('[tabscribe] ASR worker ignored an invalid request');
@@ -263,4 +284,7 @@ self.addEventListener('message', (event: MessageEvent<unknown>) => {
       post({ type: 'error', id: request.id, message: message.slice(0, 1000) });
     }),
   );
-});
+}
+
+// ORT's pthreads (see the top of this file) leave the message channel to ORT.
+if (!self.name.startsWith('em-pthread')) self.addEventListener('message', onRequest);
