@@ -5,7 +5,8 @@ fallback WASM q8/q8). Built in PR-sized pieces. This doc grows with each piece.
 
 | Piece | Scope                                                                                      | Status   |
 | ----- | ------------------------------------------------------------------------------------------ | -------- |
-| 1     | Per-call cost measurement (encoder vs decoder) and the VAD worker                          | **this** |
+| 1     | Per-call cost measurement (encoder vs decoder) and the VAD worker                          | PR #9    |
+| 1b    | Cross-origin isolation for multithreaded WASM, bench thread selector                       | **this** |
 | 2     | ASR side: segment queue, repetition and no-speech guards, interruptible partials, ordering | next     |
 | 3     | Wiring: worklet → VAD → ASR in the offscreen document, runtime backend choice, consent     |          |
 | 4     | Popup debug transcript, live bench mode (latency p50/p95), regression fixture, memory      |          |
@@ -95,17 +96,11 @@ pass can serve the no-speech check and the decode (piece 2).
     - The **WASM target is likely unreachable with base q8 single-threaded.** See the decision
       needed below.
 
-### Decision needed: the WASM fallback can't meet ≤ 6 s p50 as it stands
+### Decision: the WASM fallback can't meet ≤ 6 s p50 as it stands
 
-Options, to decide once the WASM rows are re-measured on Chrome stable:
-
-1. **Multithreaded WASM.** Cross-origin isolation (`cross_origin_embedder_policy` +
-   `cross_origin_opener_policy` in the manifest) enables ORT's threads. The encoder is mostly matrix
-   multiplication and should scale with the 12 threads. This needs checking against our CORS model
-   downloads and the offscreen document.
-2. **whisper-tiny on WASM only.** Its encoder is several times cheaper (your bench: EN RTF 0.113 vs
-   base q8 0.266). It's a second download and model to test, but only on machines without WebGPU.
-3. **Relax the WASM target**, for example to ≤ 10 s p50 / ≤ 16 s p95, and say so in the UI.
+Options, in the order chosen: (1) multithreaded WASM via cross-origin isolation, (2) whisper-tiny on
+WASM only, (3) relax the WASM target. Option 1 is built and measured below; options 2 and 3 are
+only needed if it fails on Chrome stable.
 
 ### VAD worker (Silero v6.2.3 vs the energy fallback)
 
@@ -129,11 +124,85 @@ default tuning, 10 s maximum segment.
   cut is forced, the segmenter should cut at the quietest frame in the last 1–2 s, as Silero's
   `get_speech_timestamps` does. That's for the tuning piece.
 
+## Cross-origin isolation (multithreaded WASM)
+
+The manifest sets `cross_origin_embedder_policy: { value: 'require-corp' }` and
+`cross_origin_opener_policy: { value: 'same-origin' }`, the MV3 keys from Chrome 93
+([COEP](https://developer.chrome.com/docs/extensions/reference/manifest/cross-origin-embedder-policy),
+[COOP](https://developer.chrome.com/docs/extensions/reference/manifest/cross-origin-opener-policy)).
+`check:dist` fails if either changes.
+
+Checked on Chromium 156:
+
+| Context                                   | `crossOriginIsolated` | Notes                                               |
+| ----------------------------------------- | --------------------- | --------------------------------------------------- |
+| Popup, options page (e2e checks both)     | true                  |                                                     |
+| Offscreen document (production and bench) | true                  |                                                     |
+| Bench page and its ASR worker             | true                  | 4 threads: ORT starts 3 pthreads (4 worker targets) |
+| Service worker                            | false                 | Doesn't matter: no ORT there                        |
+
+- **Hugging Face downloads still work.** Model files are CORS fetches, and a CORS response
+  satisfies `require-corp`. whisper-base q8 downloaded from `huggingface.co` and
+  `us.aws.cdn.hf.co`, the Cache API stored it, and the next load came from cache in about 1 s. No
+  other host was contacted.
+- **ORT's pthreads need no CSP change.** ORT starts each one with
+  `new Worker(new URL(import.meta.url), { type: 'module', name: 'em-pthread' })`. In our bundle
+  that's the ASR worker's own chunk, a `'self'` URL with no `blob:`. Those copies skip the worker's
+  message handler.
+- **Tab capture broke, and is fixed.** With both headers set (either one alone is fine), a stream
+  id from `tabCapture.getMediaStreamId` called in the service worker fails in the isolated
+  offscreen document with `AbortError: Error starting tab capture`. An id requested in the popup,
+  which is isolated like the offscreen document, works. So the popup now requests the id (it's the
+  invoked context anyway) and sends it with `capture/start`. The P2 capture probe passes on the
+  isolated build: capture, reopening the popup, mute, same- and cross-origin navigation, switching
+  tabs, stop, and closing the tab.
+- **The VAD worker is unchanged**: same segments, still single-threaded, still no network.
+
+**Thread count.** By default, ORT gets half the cores, at most 4 (`defaultThreads` in
+[threads.ts](../../src/asr/threads.ts)), so the tab being captioned keeps the rest. On this 12-thread
+machine that's 4. ORT fixes the count when a worker first loads a model. The bench's **Threads**
+selector restarts the worker and reloads the model from cache when it changes.
+
+### Per-call cost: WASM q8, 1 vs 4 threads
+
+Same session, bench window in front. This time the CPU wasn't slowed down: the 1-thread rows are
+about half the earlier automated run, in line with the estimate for Chrome stable.
+
+| Config                  | Segment (s) | Features (ms) | Encoder (ms) | Decoder (ms) | Decoder steps | ms / step | Total (ms) | Call RTF |
+| ----------------------- | ----------: | ------------: | -----------: | -----------: | ------------: | --------: | ---------: | -------: |
+| wasm q8 / q8, 1 thread  |           2 |           226 |         3827 |          666 |             7 |      98.8 |       4958 |    2.479 |
+| wasm q8 / q8, 1 thread  |           5 |           168 |         3425 |         1322 |            18 |      68.5 |       5050 |    1.010 |
+| wasm q8 / q8, 1 thread  |          10 |           284 |         4241 |         1606 |            26 |      67.1 |       6066 |    0.607 |
+| wasm q8 / q8, 1 thread  |          15 |           219 |         4424 |         3080 |            49 |      69.0 |       7752 |    0.517 |
+| wasm q8 / q8, 4 threads |           2 |           261 |         1358 |          589 |             7 |      75.8 |       2223 |    1.112 |
+| wasm q8 / q8, 4 threads |           5 |           348 |         2461 |         1709 |            18 |      81.9 |       4265 |    0.853 |
+| wasm q8 / q8, 4 threads |          10 |           345 |         2149 |         1803 |            26 |      73.9 |       4393 |    0.439 |
+| wasm q8 / q8, 4 threads |          15 |           317 |         2013 |         3540 |            49 |      73.8 |       5853 |    0.390 |
+
+The decoded text is identical at both thread counts.
+
+- **The encoder roughly halves with 4 threads** (3.4–4.4 s → 1.4–2.5 s). Decoding doesn't speed up:
+  each step is small and sequential, about 70–80 ms either way.
+- **A 10 s utterance's final would land about 4.9 s after it ends** (the 0.5 s pause plus a 4.4 s
+  call) with nothing queued. That's inside **≤ 6 s p50**, where 1 thread (about 6.6 s) misses. p95
+  depends on queueing, which the live bench mode measures in piece 4.
+- If Chrome stable confirms this, option 1 is enough and whisper-tiny isn't needed. The WASM
+  plan stays as before: no partials, merge queued segments, and a maximum segment of about 10 s.
+
 ## How to re-measure on Chrome stable
 
-1. `npm run build:bench`, then reload the `dist-bench` extension in `chrome://extensions`.
-2. Open the bench page and **keep its window in front** while measuring.
-3. **Per-call cost:** load whisper-base **wasm q8/q8**, click **Measure per-call cost**, and wait
-   (about a minute). Then do the same for **webgpu fp16/fp16**.
-4. **VAD:** click **Run VAD on fixtures** (no download).
-5. Click **Copy results as Markdown** and paste it back. The export includes both new tables.
+1. Check out `feat/p3b-wasm-threads`, run `npm ci` and `npm run build:bench`, then reload the
+   `dist-bench` extension in `chrome://extensions`. The manifest changed, so the reload matters.
+2. Open the bench page and **keep its window in front** while measuring. Under **Environment**,
+   check that `crossOriginIsolated` is `true` and **Default ORT threads** shows `4 threads`.
+3. Click **Clear per-call results**.
+4. Select whisper-base, **wasm**, **q8 / q8**. Set **Threads** to **1**, click **Load model**, then
+   **Measure per-call cost** (about a minute).
+5. Set **Threads** to **auto (4)** and click **Measure per-call cost** again. It reloads the model
+   from cache on 4 threads first.
+6. Select **webgpu**, **fp16 / fp16**, keep **Threads** on **auto (4)**, click **Load model**, then
+   **Measure per-call cost**.
+7. Click **Run VAD on fixtures**.
+8. Click **Copy results as Markdown** and paste it back.
+9. Capture still works after the popup change: on a tab playing audio, open the popup, click
+   **Start**, and check that the meter moves and the tab stays audible, then **Stop**.
