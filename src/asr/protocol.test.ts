@@ -10,6 +10,29 @@ import {
 
 const audio = new Float32Array(16_000);
 const dtype = { encoder: 'fp32', decoder: 'q4' };
+const prompt = { tokens: [440, 1029, 13], language: 'en' };
+const attempt = {
+  temperature: 0,
+  avgLogprob: -0.3,
+  compressionRatio: 1.2,
+  hitTokenCap: false,
+  verdict: 'ok',
+};
+const decoded = {
+  type: 'decoded',
+  id: 5,
+  outcome: 'ok',
+  text: 'Hello.',
+  tokens: [2425, 13],
+  language: 'en',
+  englishProb: 0.98,
+  noSpeechProb: 0.01,
+  promptTokens: 0,
+  attempts: [attempt],
+  featuresMs: 20,
+  encoderMs: 300,
+  ms: 900,
+};
 
 describe('isWorkerRequest', () => {
   it.each([
@@ -22,6 +45,9 @@ describe('isWorkerRequest', () => {
     { type: 'transcribe', id: 2, audio, task: 'translate', language: 'hi' },
     { type: 'profile', id: 4, audio },
     { type: 'profile', id: 4, audio: new Float32Array(MAX_WINDOW_SAMPLES) },
+    { type: 'decode', id: 5, audio, kind: 'final', prompt: null },
+    { type: 'decode', id: 5, audio, kind: 'partial', prompt },
+    { type: 'interrupt', id: 5 },
   ])('accepts %o', (request) => {
     expect(isWorkerRequest(request)).toBe(true);
   });
@@ -49,6 +75,15 @@ describe('isWorkerRequest', () => {
     ['a missing language', { type: 'transcribe', id: 2, audio, task: 'transcribe' }],
     ['a profile longer than one window', { type: 'profile', id: 4, audio: new Float32Array(MAX_WINDOW_SAMPLES + 1) }],
     ['a profile with options', { type: 'profile', id: 4, audio, language: 'en' }],
+    ['a decode longer than one window', { type: 'decode', id: 5, audio: new Float32Array(MAX_WINDOW_SAMPLES + 1), kind: 'final', prompt: null }],
+    ['an unknown decode kind', { type: 'decode', id: 5, audio, kind: 'draft', prompt: null }],
+    ['a decode without a prompt key', { type: 'decode', id: 5, audio, kind: 'final' }],
+    ['an empty prompt', { type: 'decode', id: 5, audio, kind: 'final', prompt: { tokens: [], language: 'en' } }],
+    ['a prompt with a fractional token', { type: 'decode', id: 5, audio, kind: 'final', prompt: { tokens: [1.5], language: 'en' } }],
+    ['a prompt token outside the vocabulary', { type: 'decode', id: 5, audio, kind: 'final', prompt: { tokens: [51_865], language: 'en' } }],
+    ['a prompt over 223 tokens', { type: 'decode', id: 5, audio, kind: 'final', prompt: { tokens: new Array<number>(224).fill(1), language: 'en' } }],
+    ['a prompt without a language', { type: 'decode', id: 5, audio, kind: 'final', prompt: { tokens: [1] } }],
+    ['an interrupt with extra keys', { type: 'interrupt', id: 5, now: true }],
   ])('rejects %s', (_label, request) => {
     expect(isWorkerRequest(request)).toBe(false);
   });
@@ -71,7 +106,10 @@ describe('isWorkerResponse', () => {
     { type: 'gpu-info', id: 0, info: gpu },
     { type: 'gpu-info', id: 0, info: { available: false, reason: 'navigator.gpu is undefined' } },
     { type: 'progress', id: 1, file: 'onnx/encoder_model.onnx', loaded: 10, total: 100 },
-    { type: 'loaded', id: 1, ms: 1234.5, threads: 4 },
+    { type: 'loaded', id: 1, ms: 1234.5, threads: 4, warmMs: 300 },
+    decoded,
+    { ...decoded, outcome: 'interrupted', text: '', tokens: [], attempts: [] },
+    { ...decoded, attempts: [attempt, { ...attempt, temperature: 0.2, avgLogprob: -Infinity, verdict: 'loop' }] },
     { type: 'result', id: 2, text: 'hello', language: 'en', detectMs: null, ms: 900 },
     { type: 'result', id: 2, text: 'नमस्ते', language: 'hi', detectMs: 120, ms: 900 },
     { type: 'profile', id: 4, featuresMs: 12, encoderMs: 800, decoderMs: 450, decoderSteps: 31, text: 'hi' },
@@ -84,8 +122,16 @@ describe('isWorkerResponse', () => {
   it.each([
     ['gpu info with a missing field', { type: 'gpu-info', id: 0, info: { ...gpu, shaderF16: undefined } }],
     ['negative progress', { type: 'progress', id: 1, file: 'x', loaded: -1, total: 100 }],
-    ['NaN timing', { type: 'loaded', id: 1, ms: NaN, threads: 1 }],
-    ['a fractional thread count', { type: 'loaded', id: 1, ms: 1, threads: 1.5 }],
+    ['NaN timing', { type: 'loaded', id: 1, ms: NaN, threads: 1, warmMs: 1 }],
+    ['a fractional thread count', { type: 'loaded', id: 1, ms: 1, threads: 1.5, warmMs: 1 }],
+    ['a load without its warm-up time', { type: 'loaded', id: 1, ms: 1, threads: 1 }],
+    ['an unknown outcome', { ...decoded, outcome: 'maybe' }],
+    ['a probability over 1', { ...decoded, noSpeechProb: 1.5 }],
+    ['a positive log-probability', { ...decoded, attempts: [{ ...attempt, avgLogprob: 0.1 }] }],
+    ['a NaN log-probability', { ...decoded, attempts: [{ ...attempt, avgLogprob: NaN }] }],
+    ['an attempt with an outcome as verdict', { ...decoded, attempts: [{ ...attempt, verdict: 'interrupted' }] }],
+    ['too many attempts', { ...decoded, attempts: new Array(9).fill(attempt) }],
+    ['a fractional prompt count', { ...decoded, promptTokens: 1.5 }],
     ['a result without a language', { type: 'result', id: 2, text: 'hi', detectMs: null, ms: 1 }],
     ['a non-string error', { type: 'error', id: 3, message: 42 }],
     ['fractional decoder steps', { type: 'profile', id: 4, featuresMs: 1, encoderMs: 1, decoderMs: 1, decoderSteps: 1.5, text: '' }],
