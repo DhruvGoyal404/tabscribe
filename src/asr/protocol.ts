@@ -9,6 +9,7 @@ import {
   type DtypeSpec,
   type ModelKey,
 } from './models';
+import { isThreadCount } from './threads';
 
 export type AsrTask = 'transcribe' | 'translate';
 
@@ -19,8 +20,18 @@ export const MAX_WINDOW_SAMPLES = 16_000 * 30;
 
 export type WorkerRequest =
   | { type: 'gpu-info'; id: number }
-  /** Downloads (or reads from cache) and initialises a pinned model. */
-  | { type: 'load'; id: number; model: ModelKey; device: Device; dtype: DtypeSpec }
+  /**
+   * Downloads (or reads from cache) and initialises a pinned model. `threads` is for ONNX Runtime's
+   * WASM backend, which fixes it the first time a worker loads a model.
+   */
+  | {
+      type: 'load';
+      id: number;
+      model: ModelKey;
+      device: Device;
+      dtype: DtypeSpec;
+      threads: number;
+    }
   /** 16 kHz mono. `language: null` detects the language from the first 30 s. */
   | { type: 'transcribe'; id: number; audio: Float32Array; task: AsrTask; language: string | null }
   /**
@@ -47,7 +58,8 @@ export type GpuInfo =
 export type WorkerResponse =
   | { type: 'gpu-info'; id: number; info: GpuInfo }
   | { type: 'progress'; id: number; file: string; loaded: number; total: number }
-  | { type: 'loaded'; id: number; ms: number }
+  /** `threads`: what ONNX Runtime runs with (1 without cross-origin isolation). */
+  | { type: 'loaded'; id: number; ms: number; threads: number }
   | {
       type: 'result';
       id: number;
@@ -106,10 +118,11 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
       return hasExactKeys(value, ['type', 'id']);
     case 'load':
       return (
-        hasExactKeys(value, ['type', 'id', 'model', 'device', 'dtype']) &&
+        hasExactKeys(value, ['type', 'id', 'model', 'device', 'dtype', 'threads']) &&
         isModelKey(value.model) &&
         isDevice(value.device) &&
-        isDtypeSpec(value.dtype)
+        isDtypeSpec(value.dtype) &&
+        isThreadCount(value.threads)
       );
     case 'transcribe':
       return (
@@ -176,7 +189,11 @@ export function isWorkerResponse(value: unknown): value is WorkerResponse {
         isCount(value.total)
       );
     case 'loaded':
-      return hasExactKeys(value, ['type', 'id', 'ms']) && isCount(value.ms);
+      return (
+        hasExactKeys(value, ['type', 'id', 'ms', 'threads']) &&
+        isCount(value.ms) &&
+        isThreadCount(value.threads)
+      );
     case 'result':
       return (
         hasExactKeys(value, ['type', 'id', 'text', 'language', 'detectMs', 'ms']) &&

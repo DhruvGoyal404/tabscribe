@@ -90,6 +90,17 @@
         three places in the English clip after a warm-up call. Feature extraction, encoder and
         decoder are timed separately. Medians are shown.
       </p>
+      <p class="note">
+        Threads is ONNX Runtime's WASM thread count (it also runs the few CPU ops on WebGPU). It's
+        fixed when a worker first loads a model, so changing it restarts the worker and reloads the
+        model from cache before measuring. Load model uses it too.
+      </p>
+      <div class="controls">
+        <label
+          >Threads
+          <select id="threads"></select
+        ></label>
+      </div>
       <div class="buttons">
         <button id="profile" type="button" disabled>Measure per-call cost</button>
         <button id="clear-costs" type="button">Clear per-call results</button>

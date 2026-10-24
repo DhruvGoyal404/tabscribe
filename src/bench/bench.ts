@@ -23,6 +23,7 @@ import {
   type WorkerResponse,
 } from '../asr/protocol';
 import { ASR_SAMPLE_RATE, downmixToMono, Resampler } from '../asr/resample';
+import { defaultThreads, MAX_THREADS } from '../asr/threads';
 import {
   PROFILE_OFFSETS,
   PROFILE_SECONDS,
@@ -47,6 +48,8 @@ interface BenchRow {
   model: ModelKey;
   device: Device;
   dtype: DtypeSpec;
+  /** ORT threads; missing in rows stored before the thread selector existed (they ran on 1). */
+  threads?: number;
   cachedBeforeLoad: boolean;
   loadMs: number;
   enRtfFirst: number;
@@ -88,6 +91,7 @@ const ui = {
   clearCosts: element('clear-costs', HTMLButtonElement),
   costs: element('costs', HTMLElement),
   costTexts: element('cost-texts', HTMLElement),
+  threads: element('threads', HTMLSelectElement),
   vadKind: element('vad-kind', HTMLSelectElement),
   vadMax: element('vad-max', HTMLInputElement),
   runVad: element('run-vad', HTMLButtonElement),
@@ -96,7 +100,6 @@ const ui = {
 
 // --- Worker client ------------------------------------------------------------------------------
 
-const worker = new Worker(new URL('../asr/asr.worker.ts', import.meta.url), { type: 'module' });
 let nextId = 0;
 const pending = new Map<
   number,
@@ -104,7 +107,7 @@ const pending = new Map<
 >();
 const fileProgress = new Map<string, { loaded: number; total: number }>();
 
-worker.addEventListener('message', (event: MessageEvent<unknown>) => {
+function onWorkerMessage(event: MessageEvent<unknown>): void {
   const response = event.data;
   if (!isWorkerResponse(response)) return;
   if (response.type === 'progress') {
@@ -122,10 +125,26 @@ worker.addEventListener('message', (event: MessageEvent<unknown>) => {
   pending.delete(response.id);
   if (response.type === 'error') waiter?.reject(new Error(response.message));
   else waiter?.resolve(response);
-});
-worker.addEventListener('error', (event) => {
-  showError(`Worker error: ${event.message}`);
-});
+}
+
+function spawnWorker(): Worker {
+  const spawned = new Worker(new URL('../asr/asr.worker.ts', import.meta.url), { type: 'module' });
+  spawned.addEventListener('message', onWorkerMessage);
+  spawned.addEventListener('error', (event) => {
+    showError(`Worker error: ${event.message}`);
+  });
+  return spawned;
+}
+
+let worker = spawnWorker();
+
+/** A fresh worker, so ORT can start with another thread count. */
+function restartWorker(): void {
+  worker.terminate();
+  for (const waiter of pending.values()) waiter.reject(new Error('Worker restarted'));
+  pending.clear();
+  worker = spawnWorker();
+}
 
 function send<T extends WorkerResponse['type']>(
   expected: T,
@@ -169,7 +188,9 @@ function setBusy(busy: boolean, loaded = currentModel !== null): void {
   ui.profile.disabled = busy || !loaded;
   ui.clearCache.disabled = busy;
   ui.runVad.disabled = busy;
-  for (const select of [ui.model, ui.device, ui.encoder, ui.decoder]) select.disabled = busy;
+  for (const select of [ui.model, ui.device, ui.encoder, ui.decoder, ui.threads]) {
+    select.disabled = busy;
+  }
 }
 
 function selected(): { model: ModelKey; device: Device; dtype: DtypeSpec } {
@@ -182,6 +203,16 @@ function selected(): { model: ModelKey; device: Device; dtype: DtypeSpec } {
   }
   return { model, device, dtype: { encoder, decoder } };
 }
+
+const autoThreads = defaultThreads(self.crossOriginIsolated, navigator.hardwareConcurrency);
+
+function selectedThreads(): number {
+  const { value } = ui.threads;
+  return value === 'auto' ? autoThreads : Number(value);
+}
+
+/** Without cross-origin isolation ORT runs on one thread whatever it's asked for. */
+const effectiveThreads = (requested: number): number => (self.crossOriginIsolated ? requested : 1);
 
 async function cachedFlags(urls: string[]): Promise<boolean[]> {
   try {
@@ -261,15 +292,18 @@ function saveRows(): void {
   store(RESULTS_KEY, rows);
 }
 
-const configLabel = (model: ModelKey, device: Device, dtype: DtypeSpec): string =>
-  `${model} · ${device} · ${dtype.encoder}/${dtype.decoder}`;
+const threadsLabel = (threads: number): string =>
+  `${String(threads)} thread${threads === 1 ? '' : 's'}`;
 
-const label = (row: BenchRow): string => configLabel(row.model, row.device, row.dtype);
+const configLabel = (model: ModelKey, device: Device, dtype: DtypeSpec, threads = 1): string =>
+  `${model} · ${device} · ${dtype.encoder}/${dtype.decoder} · ${threadsLabel(threads)}`;
+
+const label = (row: BenchRow): string => configLabel(row.model, row.device, row.dtype, row.threads);
 
 function cells(row: BenchRow): string[] {
   return [
     row.model,
-    row.device,
+    `${row.device} (${threadsLabel(row.threads ?? 1)})`,
     `${row.dtype.encoder} / ${row.dtype.decoder}`,
     row.cachedBeforeLoad ? 'cached' : 'download',
     (row.loadMs / 1000).toFixed(1),
@@ -342,6 +376,7 @@ function environment(): [string, string][] {
     ['WebGPU in worker', gpuText],
     ['CPU threads', String(navigator.hardwareConcurrency)],
     ['crossOriginIsolated', `${String(self.crossOriginIsolated)} (false = single-threaded WASM)`],
+    ['Default ORT threads', threadsLabel(autoThreads)],
   ];
 }
 
@@ -515,7 +550,9 @@ function markdown(): string {
 
 // --- Actions ------------------------------------------------------------------------------------
 
-let currentModel: { model: ModelKey; device: Device; dtype: DtypeSpec; loadMs: number; cachedBeforeLoad: boolean } | null = null; // prettier-ignore
+let currentModel: { model: ModelKey; device: Device; dtype: DtypeSpec; threads: number; loadMs: number; cachedBeforeLoad: boolean } | null = null; // prettier-ignore
+/** The thread count ORT started with in the current worker, once it has loaded a model. */
+let workerThreads: number | null = null;
 
 async function updateSize(): Promise<void> {
   const { model, dtype } = selected();
@@ -533,20 +570,39 @@ async function updateSize(): Promise<void> {
   }
 }
 
+/** Loads into the current worker, restarting it first if ORT runs there on another count. */
+async function loadInto(
+  choice: ReturnType<typeof selected>,
+  requested: number,
+): Promise<NonNullable<typeof currentModel>> {
+  const cachedBeforeLoad = (await cachedFlags(modelFileUrls(choice.model, choice.dtype))).every(
+    Boolean,
+  );
+  ui.progress.textContent = cachedBeforeLoad ? 'Loading from cache…' : 'Starting download…';
+  currentModel = null;
+  if (workerThreads !== null && workerThreads !== effectiveThreads(requested)) {
+    restartWorker();
+    workerThreads = null;
+  }
+  const { ms, threads } = await send('loaded', (id) => ({
+    type: 'load',
+    id,
+    ...choice,
+    threads: requested,
+  }));
+  workerThreads = threads;
+  const loaded = { ...choice, threads, loadMs: ms, cachedBeforeLoad };
+  currentModel = loaded;
+  ui.progress.textContent = `Loaded ${choice.model} on ${choice.device} (${threadsLabel(threads)}) in ${(ms / 1000).toFixed(1)} s.`;
+  return loaded;
+}
+
 async function loadModel(): Promise<void> {
-  const choice = selected();
   showError('');
   setBusy(true, false);
   fileProgress.clear();
   try {
-    const cachedBeforeLoad = (await cachedFlags(modelFileUrls(choice.model, choice.dtype))).every(
-      Boolean,
-    );
-    ui.progress.textContent = cachedBeforeLoad ? 'Loading from cache…' : 'Starting download…';
-    currentModel = null;
-    const { ms } = await send('loaded', (id) => ({ type: 'load', id, ...choice }));
-    currentModel = { ...choice, loadMs: ms, cachedBeforeLoad };
-    ui.progress.textContent = `Loaded ${choice.model} on ${choice.device} in ${(ms / 1000).toFixed(1)} s.`;
+    await loadInto(selected(), selectedThreads());
   } catch (error) {
     showError(String(error));
     ui.progress.textContent = '';
@@ -594,6 +650,7 @@ async function runBenchmark(): Promise<void> {
       model: loaded.model,
       device: loaded.device,
       dtype: loaded.dtype,
+      threads: loaded.threads,
       cachedBeforeLoad: loaded.cachedBeforeLoad,
       loadMs: loaded.loadMs,
       enRtfFirst: rtf(enFirst.ms, enAudio.length),
@@ -620,11 +677,16 @@ async function runBenchmark(): Promise<void> {
 }
 
 async function profileCalls(): Promise<void> {
-  const loaded = currentModel;
+  let loaded = currentModel;
   if (!loaded) return;
   showError('');
   setBusy(true);
   try {
+    const requested = selectedThreads();
+    if (effectiveThreads(requested) !== loaded.threads) {
+      const { model, device, dtype } = loaded;
+      loaded = await loadInto({ model, device, dtype }, requested);
+    }
     const audio = await fixtureAudio(fixture('en'));
     const profileOne = (segment: Float32Array) => {
       const copy = segment.slice();
@@ -632,7 +694,7 @@ async function profileCalls(): Promise<void> {
     };
     ui.progress.textContent = 'Per-call cost: warm-up…';
     await profileOne(audio.subarray(0, secondsToSamples(PROFILE_SECONDS[0])));
-    const config = configLabel(loaded.model, loaded.device, loaded.dtype);
+    const config = configLabel(loaded.model, loaded.device, loaded.dtype, loaded.threads);
     for (const seconds of PROFILE_SECONDS) {
       const length = secondsToSamples(seconds);
       const timings: CallTiming[] = [];
@@ -692,6 +754,18 @@ fillSelect(ui.device, DEVICES, 'webgpu');
 fillSelect(ui.encoder, DTYPES, 'fp32');
 fillSelect(ui.decoder, DTYPES, 'q4');
 fillSelect(ui.vadKind, ['silero', 'energy'], 'silero');
+fillSelect(
+  ui.threads,
+  [
+    'auto',
+    ...[1, 2, 4, 8, 12, 16]
+      .filter((n) => n <= Math.min(MAX_THREADS, navigator.hardwareConcurrency))
+      .map(String),
+  ],
+  'auto',
+);
+const autoOption = ui.threads.querySelector('option[value="auto"]');
+if (autoOption) autoOption.textContent = `auto (${String(autoThreads)})`;
 
 for (const select of [ui.model, ui.device, ui.encoder, ui.decoder]) {
   select.addEventListener('change', () => void updateSize());
