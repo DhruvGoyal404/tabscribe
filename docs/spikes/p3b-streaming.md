@@ -7,8 +7,8 @@ fallback WASM q8/q8). Built in PR-sized pieces. This doc grows with each piece.
 | ----- | ------------------------------------------------------------------------------------------ | -------- |
 | 1     | Per-call cost measurement (encoder vs decoder) and the VAD worker                          | PR #9    |
 | 1b    | Cross-origin isolation for multithreaded WASM, bench thread selector                       | PR #11   |
-| 1c    | Chrome stable results, the q8 step-count check, features for the real audio only           | **this** |
-| 2     | ASR side: segment queue, repetition and no-speech guards, interruptible partials, ordering | next     |
+| 1c    | Chrome stable results, the q8 step-count check, features for the real audio only           | PR #12   |
+| 2     | ASR side: segment queue, repetition and no-speech guards, interruptible partials, ordering | **this** |
 | 3     | Wiring: worklet → VAD → ASR in the offscreen document, runtime backend choice, consent     |          |
 | 4     | Popup debug transcript, live bench mode (latency p50/p95), regression fixture, memory      |          |
 
@@ -290,6 +290,112 @@ WASM q8 texts are identical before and after. WebGPU fp16 changed one name's spe
 segments, but it does that from run to run anyway: two runs with the same features gave "Krilter"
 and "Kralter".
 
+## Piece 2: the ASR side
+
+Everything here is pure or behind the worker's message protocol, so piece 3 only has to wire it
+into the offscreen document.
+
+### Decode guards (guards.ts, asr.worker.ts)
+
+A caption segment goes to the worker as a `decode` request, which follows openai/whisper's
+transcribe():
+
+1. One encoder pass, then one decoder step from `<|startoftranscript|>`. That step gives the
+   language probabilities and the no-speech probability (`<|nocaptions|>` in this vocabulary).
+2. **English only.** If P(en) is below 0.25 among languages, the segment is `not-english` and isn't
+   decoded (`no-speech` if the no-speech probability is also above 0.6). The 0.25 is a first guess
+   for the tuning piece.
+3. Greedy decoding, forced to English, with:
+   - a **token cap** of 8 tokens per second of audio plus 8 (at most 224), where fast speech is
+     about 5.5;
+   - **no repeated 4-gram** among the generated tokens. Transformers.js's own `no_repeat_ngram_size`
+     also counts the prompt, so a custom logits processor replaces it.
+4. Each attempt is judged:
+   - **no-speech** if the no-speech probability is above 0.6 and the average log-probability is
+     below −1.0: dropped, no retry;
+   - **loop** if the compression ratio is above 2.4, the cap was hit, or a phrase repeats back to
+     back (one word 4 times, a longer phrase 3 times);
+   - **low-confidence** if the average log-probability is below −1.0;
+   - otherwise **ok**.
+5. A loop or low confidence is retried at **temperature 0.2, then 0.4** (sampling keeps
+   Transformers.js's default top-k of 50). After the last attempt, a loop is dropped and low
+   confidence is shown.
+
+Transformers.js's generate() doesn't return per-token scores, so a last logits processor records
+them. Whisper's generate() appends its own processor after ours, so each step's logits are kept by
+reference and read on the next step, after every processor has edited them in place.
+
+A **warm-up** decode of half a second of silence runs right after loading (`warmMs` in `loaded`).
+
+### Scheduling (scheduler.ts)
+
+- Finals go first and in order, one worker job at a time, so captions come back in segment order.
+- **Partials** (WebGPU only): the newest one per segment, only while no final waits. A final that
+  arrives while a partial runs **interrupts** it at the next decoder step: generate() awaits ORT
+  between steps, so the worker handles the `interrupt` message mid-decode. A partial's caption is
+  never shown after its final.
+- **WASM**: no partials, and finals that queued behind a busy worker are **merged** into one call
+  (up to 12 s, without repeating the overlap), paying the encoder once.
+
+### Overlap de-dup and the previous-text prompt (context.ts)
+
+The segment after a forced cut repeats the last 2 s of audio, so its text starts with words the
+previous caption already showed. `dropRepeatedPrefix` removes them. The overlap is decoded twice,
+so the repeat isn't always exact: up to one word in four may differ, and one word at the cut may be
+garbled on either side. A single word only counts if it's an exact repeat longer than three
+letters.
+
+The **previous-text prompt** is restricted as decided:
+
+- only when the previous segment ended in a forced cut;
+- only its last 24 tokens;
+- never after a decode that failed a guard or was dropped;
+- reset after a pause over 2 s, and dropped by the worker when the language differs.
+
+### Streaming results: WER and loops, with and without the prompt
+
+The bench's **Run streaming captions** streams each fixture through the VAD, then its finals
+through the scheduler and the guarded decode, in order. It runs at the default 10 s maximum
+segment and at 4 s, which forces cuts, because the English fixture has natural pauses at least
+every 10 s. Chromium, whisper-base, WASM on 4 threads:
+
+| Config             | Max segment | Forced cuts | WER, no prompt | WER, prompt | Loops caught | Loops shown |
+| ------------------ | ----------: | ----------: | -------------: | ----------: | -----------: | ----------: |
+| webgpu fp16 / fp16 |        10 s |      0 of 7 |          5.3 % |       5.3 % |            0 |           0 |
+| webgpu fp16 / fp16 |         4 s |    12 of 19 |         11.5 % |      20.4 % |            0 |           0 |
+| wasm q8 / q8       |        10 s |      0 of 7 |          8.0 % |       8.0 % |            0 |           0 |
+| wasm q8 / q8       |         4 s |    12 of 19 |         12.4 % |      10.6 % |            0 |           0 |
+
+- **No loops** in any run: the guards caught none, so none were shown. One WASM segment was retried
+  once with the prompt (low confidence), then passed. This fixture is clean read speech, so it
+  doesn't test the loop guards much; the regression fixture in piece 4 should include music,
+  silence and noise.
+- **Hindi** (FLEURS): every segment is `not-english` (or `no-speech` for 3 short 4 s pieces), so no
+  captions are shown.
+- **The de-dup matters more than the prompt.** With exact matching only, the 4 s runs scored
+  35.4 % without the prompt, and the prompt seemed to halve that (17.7 % and 23.0 %). Almost all of
+  that came from overlaps decoded slightly differently the second time. With the tolerant matching
+  the no-prompt runs drop to 11.5 % and 12.4 %.
+- **With the de-dup fixed, the prompt is mixed:** 9 points worse on WebGPU, 2 points better on
+  WASM. With the prompt, Whisper sometimes rewords the overlap instead of repeating it ("He is the
+  apostle of the middle classes and we are glad to welcome his gospel"), which no de-dup can
+  match. Without it, the q8 skip of a clipped clause (above) didn't show up here.
+- The sample is small: one 47 s fixture, 12 artificial forced cuts, and WebGPU fp16 isn't
+  deterministic from run to run.
+
+**Decision: captions ship with the prompt off.** The code stays behind the scheduler's `prompting`
+flag, off by default, restricted as above. The tuning piece measures it again on a
+continuous-speech fixture with real 10 s forced cuts.
+
+Remaining errors at the cuts, for the tuning piece:
+
+- A word the cut garbles in the previous caption stays wrong ("welcome you. his gospel"): it's
+  already shown. The quietest-point forced cut should make this rarer.
+- Repeats decoded with a different number of words aren't matched ("roast beef" against
+  "Rosebeath").
+- Partials aren't de-duplicated, so a partial after a forced cut can briefly show the repeated
+  words until its final replaces it.
+
 ## How to re-measure on Chrome stable
 
 1. On `main`, run `npm ci` and `npm run build:bench`, then reload the `dist-bench` extension in
@@ -298,5 +404,6 @@ and "Kralter".
    check that `crossOriginIsolated` is `true` and **Default ORT threads** shows `4 threads`.
 3. Click **Clear per-call results**, select a model, device and dtypes, set **Threads**, click
    **Load model**, then **Measure per-call cost**. Repeat for each config.
-4. Click **Copy results as Markdown**. The decoded texts aren't in the export; to compare them,
-   open **Decoded text** under the per-call table.
+4. For piece 2, load a model and click **Run streaming captions** (a few minutes on WASM).
+5. Click **Copy results as Markdown**. The streaming captions are in the export; the per-call
+   decoded texts aren't (open **Decoded text** under the per-call table).
