@@ -6,7 +6,8 @@ fallback WASM q8/q8). Built in PR-sized pieces. This doc grows with each piece.
 | Piece | Scope                                                                                      | Status   |
 | ----- | ------------------------------------------------------------------------------------------ | -------- |
 | 1     | Per-call cost measurement (encoder vs decoder) and the VAD worker                          | PR #9    |
-| 1b    | Cross-origin isolation for multithreaded WASM, bench thread selector                       | **this** |
+| 1b    | Cross-origin isolation for multithreaded WASM, bench thread selector                       | PR #11   |
+| 1c    | Chrome stable results, the q8 step-count check, features for the real audio only           | **this** |
 | 2     | ASR side: segment queue, repetition and no-speech guards, interruptible partials, ordering | next     |
 | 3     | Wiring: worklet → VAD → ASR in the offscreen document, runtime backend choice, consent     |          |
 | 4     | Popup debug transcript, live bench mode (latency p50/p95), regression fixture, memory      |          |
@@ -99,8 +100,8 @@ pass can serve the no-speech check and the decode (piece 2).
 ### Decision: the WASM fallback can't meet ≤ 6 s p50 as it stands
 
 Options, in the order chosen: (1) multithreaded WASM via cross-origin isolation, (2) whisper-tiny on
-WASM only, (3) relax the WASM target. Option 1 is built and measured below; options 2 and 3 are
-only needed if it fails on Chrome stable.
+WASM only, (3) relax the WASM target. Option 1 is built and measured below, and
+[Chrome stable confirmed it](#chrome-stable-results-chrome-155): options 2 and 3 aren't needed.
 
 ### VAD worker (Silero v6.2.3 vs the energy fallback)
 
@@ -189,20 +190,113 @@ The decoded text is identical at both thread counts.
 - If Chrome stable confirms this, option 1 is enough and whisper-tiny isn't needed. The WASM
   plan stays as before: no partials, merge queued segments, and a maximum segment of about 10 s.
 
+## Chrome stable results (Chrome 155)
+
+Measured on Chrome 155 stable, bench window in front, whisper-base, before the feature cut below.
+Totals per call:
+
+| Config                  | 2 s    | 5 s    | 10 s   | 15 s   | Encoder      |
+| ----------------------- | ------ | ------ | ------ | ------ | ------------ |
+| wasm q8 / q8, 1 thread  | 3.2 s  | 3.9 s  | 4.1 s  | 5.1 s  | about 2.7 s  |
+| wasm q8 / q8, 4 threads | 1.7 s  | 2.2 s  | 2.8 s  | 3.9 s  | 1.2–1.5 s    |
+| webgpu fp16 / fp16      | 0.87 s | 1.67 s | 2.20 s | 2.71 s | about 0.32 s |
+
+- Features took 130–250 ms on every call, whatever the segment length.
+- The decoder took about 42–55 ms per step on both backends.
+- VAD: English, 7 segments at natural pauses. Hindi, 6 segments, two of them cut at the 10 s
+  maximum.
+- Capture start through the popup works on Chrome stable: the meter moves, the tab stays audible,
+  and Stop works.
+
+**Decision: the WASM fallback is whisper-base q8 / q8 on 4 threads, and whisper-tiny isn't
+needed.** A 10 s utterance's final lands about 3.3 s after it ends (the 0.5 s pause plus a 2.8 s
+call), well inside ≤ 6 s p50.
+
+## Why WASM q8 decoded fewer steps on 10 s segments
+
+On Chrome stable, the median for the 10 s segments was 26 decoder steps on WASM q8 against 34 on
+WebGPU fp16, while 5 s and 15 s matched closely. The three 10 s segments' texts show where the gap
+comes from. Two match apart from a word or two. The middle one (starting at 18.85 s, mid-sentence)
+differs:
+
+- fp16: "He is drawn from eating and its results occur most readily to the mind. He has graved
+  doubts whether Sir Frederick Layton's work is really Greek after all."
+- q8: "He has graved doubts whether Sir Frederick Layton's work is really Greek after all."
+
+q8 skips the clipped opening clause and transcribes the rest. It doesn't stop early: both decodes
+end on "after all." and `<|endoftext|>`. It isn't the token cap either (224, against 19 tokens
+here).
+
+Which half is responsible? Same segment, WASM, Chromium:
+
+| Encoder / decoder  | Middle segment            | Median steps |
+| ------------------ | ------------------------- | -----------: |
+| fp32 / fp32        | keeps "He is drawn from…" |           34 |
+| q8 / fp32          | skips it                  |           26 |
+| fp32 / q8          | skips it                  |           26 |
+| q8 / q8            | skips it                  |           26 |
+| webgpu fp16 / fp16 | keeps it                  |           34 |
+
+Either quantized half is enough, because the choice is a near-tie. Every config decodes " He"
+first. At the next token, fp32 gives " is" (carry on with the clipped sentence) log-prob −0.83 and
+" has" (jump to the next sentence) −1.03: 44 % against 36 %. q8 noise reverses that order (q8 / q8:
+−1.14 against −0.69). This was measured in Node with onnxruntime-node on the same segment, where
+fp32 and fp16 decode the long version and every q8 mix decodes the short one, as in the browser.
+In the q8 decoder, the uncached forward pass and the KV-cached decode can even disagree with each
+other. That fits dynamic int8 quantization, which takes its activation scales from whatever it
+processes at once: the whole sequence uncached, but one token at a time with the cache.
+
+What it means for captions:
+
+- It only bites on a segment that starts mid-sentence. The bench's fixed offsets do that; the VAD
+  cuts at pauses, except for its forced 10 s cuts (Hindi had two).
+- The quietest-point forced cut (tuning piece) moves those cuts to the quietest stretch, so they
+  start at a word gap.
+- Piece 2 prompts a decode with the previous segment's text, so Whisper continues mid-sentence
+  instead of jumping to the next one. Conditioning on previous text is a known way for loops to
+  propagate, so it's restricted:
+  - only when the previous segment ended in a forced cut, not a natural pause;
+  - only its last 20–30 tokens;
+  - never when the previous segment failed a guard or was dropped as no-speech;
+  - reset after a long silence or a language change.
+
+  The bench measures WER and loop count with and without it.
+
+**Decision: q8 / q8 stays the WASM fallback.** Its other texts match fp16's apart from a word or
+two, and the skip above only happens on segments that start mid-sentence.
+
+## Features for the real audio only
+
+Whisper always sees 30 s. The feature extractor zero-pads shorter audio to 480 000 samples and
+computes all 3000 STFT frames plus the mel projection, so a 5 s segment pays for 25 s of silence.
+Every padded frame gives the same value, which can't raise the maximum used for normalisation. So
+the worker now computes the frames up to just past the audio plus one all-zero frame, and repeats
+that frame's value for the rest ([features.ts](../../src/asr/features.ts)). The output matches the
+full extractor to within 5e-7 (a few float32 steps, from ONNX Runtime's matmul rounding a few
+values differently with fewer columns). features.test.ts checks this on 13 clips, including empty,
+silent, near-silent, 30 s and 40 s.
+
+Feature time per call, Chromium, same session:
+
+| Backend         | 2 s    | 5 s    | 10 s   | 15 s   |
+| --------------- | ------ | ------ | ------ | ------ |
+| webgpu, before  | 239 ms | 241 ms | 202 ms | 327 ms |
+| webgpu, after   | 23 ms  | 51 ms  | 74 ms  | 98 ms  |
+| wasm q8, before | 484 ms | 382 ms | 356 ms | 412 ms |
+| wasm q8, after  | 34 ms  | 80 ms  | 125 ms | 182 ms |
+
+The WASM "before" row ran alongside other work, so it's high. Chrome stable showed 130–250 ms.
+WASM q8 texts are identical before and after. WebGPU fp16 changed one name's spelling in two
+segments, but it does that from run to run anyway: two runs with the same features gave "Krilter"
+and "Kralter".
+
 ## How to re-measure on Chrome stable
 
-1. Check out `feat/p3b-wasm-threads`, run `npm ci` and `npm run build:bench`, then reload the
-   `dist-bench` extension in `chrome://extensions`. The manifest changed, so the reload matters.
+1. On `main`, run `npm ci` and `npm run build:bench`, then reload the `dist-bench` extension in
+   `chrome://extensions`.
 2. Open the bench page and **keep its window in front** while measuring. Under **Environment**,
    check that `crossOriginIsolated` is `true` and **Default ORT threads** shows `4 threads`.
-3. Click **Clear per-call results**.
-4. Select whisper-base, **wasm**, **q8 / q8**. Set **Threads** to **1**, click **Load model**, then
-   **Measure per-call cost** (about a minute).
-5. Set **Threads** to **auto (4)** and click **Measure per-call cost** again. It reloads the model
-   from cache on 4 threads first.
-6. Select **webgpu**, **fp16 / fp16**, keep **Threads** on **auto (4)**, click **Load model**, then
-   **Measure per-call cost**.
-7. Click **Run VAD on fixtures**.
-8. Click **Copy results as Markdown** and paste it back.
-9. Capture still works after the popup change: on a tab playing audio, open the popup, click
-   **Start**, and check that the meter moves and the tab stays audible, then **Stop**.
+3. Click **Clear per-call results**, select a model, device and dtypes, set **Threads**, click
+   **Load model**, then **Measure per-call cost**. Repeat for each config.
+4. Click **Copy results as Markdown**. The decoded texts aren't in the export; to compare them,
+   open **Decoded text** under the per-call table.
