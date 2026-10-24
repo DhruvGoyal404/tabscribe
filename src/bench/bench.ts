@@ -18,6 +18,7 @@ import {
 import {
   isWorkerResponse,
   type AsrTask,
+  type DecodePrompt,
   type GpuInfo,
   type WorkerRequest,
   type WorkerResponse,
@@ -35,6 +36,8 @@ import {
 } from './cost';
 import { FIXTURES, type Fixture } from './fixtures';
 import { characterErrorRate, wordErrorRate } from './metrics';
+import { DEFAULT_SEGMENTER } from '../vad/segmenter';
+import { decodeStream, type StreamRun } from './stream';
 import { runVad, type VadRun } from './vad-run';
 
 /** Cache API bucket Transformers.js stores model files in. */
@@ -43,6 +46,7 @@ const MODEL_CACHE = 'transformers-cache';
 const CAPTURE_RATE = 48_000;
 const RESULTS_KEY = 'tabscribe-bench-results';
 const COSTS_KEY = 'tabscribe-bench-costs';
+const STREAM_KEY = 'tabscribe-bench-stream';
 
 interface BenchRow {
   model: ModelKey;
@@ -96,6 +100,11 @@ const ui = {
   vadMax: element('vad-max', HTMLInputElement),
   runVad: element('run-vad', HTMLButtonElement),
   vadResults: element('vad-results', HTMLElement),
+  streamMax: element('stream-max', HTMLInputElement),
+  runStream: element('run-stream', HTMLButtonElement),
+  clearStream: element('clear-stream', HTMLButtonElement),
+  streamResults: element('stream-results', HTMLElement),
+  streamTexts: element('stream-texts', HTMLElement),
 };
 
 // --- Worker client ------------------------------------------------------------------------------
@@ -188,6 +197,7 @@ function setBusy(busy: boolean, loaded = currentModel !== null): void {
   ui.profile.disabled = busy || !loaded;
   ui.clearCache.disabled = busy;
   ui.runVad.disabled = busy;
+  ui.runStream.disabled = busy || !loaded;
   for (const select of [ui.model, ui.device, ui.encoder, ui.decoder, ui.threads]) {
     select.disabled = busy;
   }
@@ -493,6 +503,127 @@ async function runVadOnFixtures(): Promise<void> {
   }
 }
 
+// --- Streaming captions -------------------------------------------------------------------------
+
+interface StreamRow {
+  config: string;
+  fixture: Fixture['key'];
+  maxSegmentMs: number;
+  prompting: boolean;
+  /** Of the joined captions; null where captions don't apply (Hindi: English only). */
+  wer: number | null;
+  stats: StreamRun['stats'];
+  transcript: string;
+}
+
+const streamRows = loadStored<StreamRow>(STREAM_KEY);
+
+function decodeSegment(audio: Float32Array, prompt: DecodePrompt | null) {
+  const copy = audio.slice();
+  return send('decoded', (id) => ({ type: 'decode', id, audio: copy, kind: 'final', prompt }), [
+    copy.buffer,
+  ]);
+}
+
+function streamCells(row: StreamRow): string[] {
+  const { stats } = row;
+  return [
+    row.config,
+    row.fixture,
+    `${String(row.maxSegmentMs / 1000)} s`,
+    row.prompting ? 'on' : 'off',
+    String(stats.segments),
+    String(stats.forcedCuts),
+    String(stats.prompted),
+    row.wer === null ? '—' : pct(row.wer),
+    String(stats.loopsCaught),
+    String(stats.loopsShown),
+    String(stats.retries),
+    Object.entries(stats.outcomes)
+      .map(([outcome, count]) => `${outcome} ${String(count)}`)
+      .join(', '),
+    (stats.decodeMs / 1000).toFixed(1),
+  ];
+}
+
+const streamLabel = (row: StreamRow): string =>
+  `${row.config}, ${row.fixture}, ${String(row.maxSegmentMs / 1000)} s max, prompt ${row.prompting ? 'on' : 'off'}`;
+
+function renderStream(): void {
+  ui.streamResults.replaceChildren(
+    ...streamRows.map((row) => {
+      const tr = document.createElement('tr');
+      for (const text of streamCells(row)) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.append(td);
+      }
+      return tr;
+    }),
+  );
+  ui.streamTexts.replaceChildren(
+    ...streamRows.map((row) => {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = `Captions: ${streamLabel(row)}`;
+      const text = document.createElement('p');
+      text.textContent = row.transcript || '(none shown)';
+      details.append(summary, text);
+      return details;
+    }),
+  );
+}
+
+/**
+ * Each fixture through the VAD, then its finals through the guarded decode in order, with and
+ * without the previous-text prompt, at the default maximum segment and at a shorter one that forces
+ * cuts (the prompt only applies after a forced cut).
+ */
+async function runStream(): Promise<void> {
+  const loaded = currentModel;
+  if (!loaded) return;
+  const maxima = [...new Set([DEFAULT_SEGMENTER.maxSegmentMs, Number(ui.streamMax.value)])];
+  showError('');
+  setBusy(true);
+  try {
+    const config = configLabel(loaded.model, loaded.device, loaded.dtype, loaded.threads);
+    for (const entry of FIXTURES) {
+      for (const maxSegmentMs of maxima) {
+        const name = `${entry.key}, ${String(maxSegmentMs)} ms max`;
+        ui.progress.textContent = `Streaming ${name}: VAD…`;
+        const vad = await runVad(await fixtureCapture(entry), CAPTURE_RATE, 'silero', {
+          maxSegmentMs,
+        });
+        const finals = vad.events.filter((event) => event.type === 'final');
+        for (const prompting of [false, true]) {
+          ui.progress.textContent = `Streaming ${name}, prompt ${prompting ? 'on' : 'off'}: decoding ${String(finals.length)} segments…`;
+          const run = await decodeStream(finals, decodeSegment, prompting);
+          streamRows.push({
+            config,
+            fixture: entry.key,
+            maxSegmentMs,
+            prompting,
+            wer:
+              entry.language === 'en'
+                ? wordErrorRate(entry.reference, run.transcript, 'en').rate
+                : null,
+            stats: run.stats,
+            transcript: run.transcript,
+          });
+          store(STREAM_KEY, streamRows);
+          renderStream();
+        }
+      }
+    }
+    ui.progress.textContent = `Streaming done: ${config}.`;
+  } catch (error) {
+    showError(String(error));
+    ui.progress.textContent = '';
+  } finally {
+    setBusy(false);
+  }
+}
+
 function markdown(): string {
   const header = [
     'Model', 'Device', 'Enc / Dec', 'Load', 'Load (s)', 'EN RTF 1st', 'EN RTF 2nd', 'EN WER',
@@ -536,6 +667,27 @@ function markdown(): string {
     ]),
     line(Array.from({ length: 8 }, () => '---')),
     ...vadRuns.map((entry) => line(vadCells(entry))),
+    '',
+    '### Streaming captions',
+    line([
+      'Config',
+      'Fixture',
+      'Max segment',
+      'Prompt',
+      'Segments',
+      'Forced cuts',
+      'Prompted',
+      'WER',
+      'Loops caught',
+      'Loops shown',
+      'Retries',
+      'Outcomes',
+      'Decode (s)',
+    ]),
+    line(Array.from({ length: 13 }, () => '---')),
+    ...streamRows.map((row) => line(streamCells(row))),
+    '',
+    ...streamRows.map((row) => `- ${streamLabel(row)}: ${row.transcript}`),
     '',
     '### Outputs',
     ...rows.flatMap((row) => [
@@ -784,6 +936,12 @@ ui.copy.addEventListener('click', () => {
 });
 ui.profile.addEventListener('click', () => void profileCalls());
 ui.runVad.addEventListener('click', () => void runVadOnFixtures());
+ui.runStream.addEventListener('click', () => void runStream());
+ui.clearStream.addEventListener('click', () => {
+  streamRows.length = 0;
+  store(STREAM_KEY, streamRows);
+  renderStream();
+});
 ui.clearCosts.addEventListener('click', () => {
   costs.length = 0;
   store(COSTS_KEY, costs);
@@ -798,6 +956,7 @@ ui.clearResults.addEventListener('click', () => {
 renderEnvironment();
 renderRows();
 renderCosts();
+renderStream();
 setBusy(false);
 void updateSize();
 void send('gpu-info', (id) => ({ type: 'gpu-info', id })).then(
