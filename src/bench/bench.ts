@@ -740,6 +740,8 @@ async function loadInto(
     id,
     ...choice,
     threads: requested,
+    // Load model is the explicit action; the button shows the download size first.
+    allowDownload: true,
   }));
   workerThreads = threads;
   const loaded = { ...choice, threads, loadMs: ms, cachedBeforeLoad };
