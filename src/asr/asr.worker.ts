@@ -8,6 +8,8 @@
 // - The ONNX Runtime WebAssembly binary is bundled with the extension. Transformers.js would
 //   otherwise point ORT at jsDelivr, so wasmPaths is set before any session is created.
 // - Model files are cached with the Cache API (`transformers-cache`), keyed by their pinned URL.
+// - Nothing is downloaded unless the load request allows it (an explicit user action). Every
+//   request Transformers.js makes goes through env.fetch; cache hits don't.
 //
 // Threads: when the extension is cross-origin isolated, ORT's WASM backend starts its pthreads as
 // module workers from this same script (import.meta.url) named "em-pthread". Those copies only run
@@ -53,6 +55,15 @@ env.useBrowserCache = true;
 // files are local to the extension anyway.
 env.useWasmCache = false;
 env.experimental_useCrossOriginStorage = false;
+/** Set per load from its request. */
+let downloadsAllowed = false;
+const networkFetch = env.fetch;
+env.fetch = (input, init) => {
+  if (!downloadsAllowed) {
+    return Promise.reject(new Error(`ModelNotDownloaded: ${String(input)} isn't cached`));
+  }
+  return networkFetch(input, init);
+};
 const onnxWasm = env.backends.onnx.wasm;
 if (onnxWasm) onnxWasm.wasmPaths = { wasm: new URL(ortWasmUrl, self.location.href).href };
 
@@ -84,6 +95,7 @@ function startOrtWith(requested: number): number {
 async function load(request: Extract<WorkerRequest, { type: 'load' }>): Promise<void> {
   await unload();
   const threads = startOrtWith(request.threads);
+  downloadsAllowed = request.allowDownload;
   const { id, revision } = MODELS[request.model];
   const started = performance.now();
   asr = await pipeline('automatic-speech-recognition', id, {

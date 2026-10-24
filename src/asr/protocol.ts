@@ -23,7 +23,8 @@ export type WorkerRequest =
   | { type: 'gpu-info'; id: number }
   /**
    * Downloads (or reads from cache) and initialises a pinned model. `threads` is for ONNX Runtime's
-   * WASM backend, which fixes it the first time a worker loads a model.
+   * WASM backend, which fixes it the first time a worker loads a model. Without `allowDownload`,
+   * only cached files load: set it only after an explicit user action for this download.
    */
   | {
       type: 'load';
@@ -32,6 +33,7 @@ export type WorkerRequest =
       device: Device;
       dtype: DtypeSpec;
       threads: number;
+      allowDownload: boolean;
     }
   /** 16 kHz mono. `language: null` detects the language from the first 30 s. */
   | { type: 'transcribe'; id: number; audio: Float32Array; task: AsrTask; language: string | null }
@@ -218,11 +220,20 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
       return hasExactKeys(value, ['type', 'id']);
     case 'load':
       return (
-        hasExactKeys(value, ['type', 'id', 'model', 'device', 'dtype', 'threads']) &&
+        hasExactKeys(value, [
+          'type',
+          'id',
+          'model',
+          'device',
+          'dtype',
+          'threads',
+          'allowDownload',
+        ]) &&
         isModelKey(value.model) &&
         isDevice(value.device) &&
         isDtypeSpec(value.dtype) &&
-        isThreadCount(value.threads)
+        isThreadCount(value.threads) &&
+        typeof value.allowDownload === 'boolean'
       );
     case 'transcribe':
       return (
