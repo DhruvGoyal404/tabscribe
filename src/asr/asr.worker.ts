@@ -22,6 +22,7 @@ import {
 } from '@huggingface/transformers';
 import ortWasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url';
 import { GeneratedNoRepeatNGram, Interrupt, logProbability, TokenLogprobs } from './decoding';
+import { gpuInfo } from './gpu';
 import { skipPaddingFrames, type WhisperFeatureExtractorLike } from './features';
 import {
   compressionRatio,
@@ -38,7 +39,6 @@ import {
   isWorkerRequest,
   type AsrTask,
   type AttemptSummary,
-  type GpuInfo,
   type WorkerRequest,
   type WorkerResponse,
 } from './protocol';
@@ -79,24 +79,6 @@ function startOrtWith(requested: number): number {
     );
   }
   return threads;
-}
-
-async function gpuInfo(): Promise<GpuInfo> {
-  if (!('gpu' in navigator)) return { available: false, reason: 'navigator.gpu is undefined' };
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-  if (!adapter) return { available: false, reason: 'requestAdapter() returned null' };
-  const { info, features, limits } = adapter;
-  return {
-    available: true,
-    vendor: info.vendor,
-    architecture: info.architecture,
-    device: info.device,
-    description: info.description,
-    isFallbackAdapter: info.isFallbackAdapter,
-    shaderF16: features.has('shader-f16'),
-    maxBufferSize: limits.maxBufferSize,
-    maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
-  };
 }
 
 async function load(request: Extract<WorkerRequest, { type: 'load' }>): Promise<void> {
