@@ -3,8 +3,8 @@ import { describeError, isLevel, isLevelMessage, isMessage, isReply, settle } fr
 
 describe('isMessage', () => {
   it.each([
-    { type: 'capture/start', tabId: 7 },
-    { type: 'capture/start', tabId: 0 },
+    { type: 'capture/start', tabId: 7, streamId: 'abc123' },
+    { type: 'capture/start', tabId: 0, streamId: 'abc123' },
     { type: 'capture/stop' },
     { type: 'offscreen/start', streamId: 'abc123', muted: false },
     { type: 'offscreen/start', streamId: 'abc123', muted: true },
@@ -23,11 +23,13 @@ describe('isMessage', () => {
     ['an array', [{ type: 'capture/stop' }]],
     ['an unknown type', { type: 'capture/pause' }],
     ['a missing type', { tabId: 1 }],
-    ['a string tab id', { type: 'capture/start', tabId: '1' }],
-    ['a fractional tab id', { type: 'capture/start', tabId: 1.5 }],
-    ['a negative tab id', { type: 'capture/start', tabId: -1 }],
-    ['a NaN tab id', { type: 'capture/start', tabId: NaN }],
-    ['a missing tab id', { type: 'capture/start' }],
+    ['a string tab id', { type: 'capture/start', tabId: '1', streamId: 'abc123' }],
+    ['a fractional tab id', { type: 'capture/start', tabId: 1.5, streamId: 'abc123' }],
+    ['a negative tab id', { type: 'capture/start', tabId: -1, streamId: 'abc123' }],
+    ['a NaN tab id', { type: 'capture/start', tabId: NaN, streamId: 'abc123' }],
+    ['a missing tab id', { type: 'capture/start', streamId: 'abc123' }],
+    ['a start without a stream id', { type: 'capture/start', tabId: 1 }],
+    ['a start with an empty stream id', { type: 'capture/start', tabId: 1, streamId: '' }],
     ['extra keys', { type: 'capture/stop', tabId: 1 }],
     ['an empty stream id', { type: 'offscreen/start', streamId: '', muted: false }],
     [

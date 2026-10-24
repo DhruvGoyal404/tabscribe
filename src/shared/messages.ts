@@ -5,8 +5,11 @@ import type { Level } from './level';
  * run isMessage before acting; anything else is dropped.
  */
 export type Message =
-  /** popup -> service worker */
-  | { type: 'capture/start'; tabId: number }
+  /**
+   * popup -> service worker. The popup gets the stream id: an id issued by the service worker
+   * (which isn't cross-origin isolated) fails in the isolated offscreen document.
+   */
+  | { type: 'capture/start'; tabId: number; streamId: string }
   | { type: 'capture/stop' }
   /** service worker -> offscreen document */
   | { type: 'offscreen/start'; streamId: string; muted: boolean }
@@ -46,9 +49,10 @@ export function isMessage(value: unknown): value is Message {
   switch (value.type) {
     case 'capture/start':
       return (
-        hasExactKeys(value, ['type', 'tabId']) &&
+        hasExactKeys(value, ['type', 'tabId', 'streamId']) &&
         Number.isSafeInteger(value.tabId) &&
-        (value.tabId as number) >= 0
+        (value.tabId as number) >= 0 &&
+        isBoundedString(value.streamId, MAX_STREAM_ID_LENGTH)
       );
     case 'capture/stop':
     case 'offscreen/stop':

@@ -98,8 +98,23 @@ async function send(message: Message): Promise<void> {
   }
 }
 
+async function start(tabId: number): Promise<void> {
+  let streamId: string;
+  try {
+    // Allowed because opening the popup invoked the extension on this tab (an activeTab grant).
+    // Requested here, not in the service worker: the id only works in a context that is
+    // cross-origin isolated like the offscreen document that consumes it.
+    streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+  } catch (error) {
+    ui.error.hidden = false;
+    ui.error.textContent = error instanceof Error ? error.message : String(error);
+    return;
+  }
+  await send({ type: 'capture/start', tabId, streamId });
+}
+
 ui.start.addEventListener('click', () => {
-  if (activeTabId !== undefined) void send({ type: 'capture/start', tabId: activeTabId });
+  if (activeTabId !== undefined) void start(activeTabId);
 });
 ui.stop.addEventListener('click', () => {
   void send({ type: 'capture/stop' });
