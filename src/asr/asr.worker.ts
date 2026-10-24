@@ -14,17 +14,30 @@
 // ORT's thread loop, so they skip this worker's message handler.
 import {
   env,
+  LogitsProcessorList,
   pipeline,
   Tensor,
   type AutomaticSpeechRecognitionPipeline,
   type ProgressInfo,
 } from '@huggingface/transformers';
 import ortWasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url';
+import { GeneratedNoRepeatNGram, Interrupt, logProbability, TokenLogprobs } from './decoding';
 import { skipPaddingFrames, type WhisperFeatureExtractorLike } from './features';
+import {
+  compressionRatio,
+  judge,
+  maxNewTokens,
+  NO_REPEAT_NGRAM_SIZE,
+  NO_SPEECH_THRESHOLD,
+  TEMPERATURES,
+  type Attempt,
+  type Verdict,
+} from './guards';
 import { HF_HOST, MODELS } from './models';
 import {
   isWorkerRequest,
   type AsrTask,
+  type AttemptSummary,
   type GpuInfo,
   type WorkerRequest,
   type WorkerResponse,
@@ -109,7 +122,16 @@ async function load(request: Extract<WorkerRequest, { type: 'load' }>): Promise<
   });
   allowPrecomputedEncoderOutput(asr);
   skipPaddingFrames(asr.processor.feature_extractor as unknown as WhisperFeatureExtractorLike);
-  post({ type: 'loaded', id: request.id, ms: performance.now() - started, threads });
+  checkSpecialTokens(asr);
+  const loaded = performance.now();
+  await warmUp(asr);
+  post({
+    type: 'loaded',
+    id: request.id,
+    ms: loaded - started,
+    threads,
+    warmMs: performance.now() - loaded,
+  });
 }
 
 /**
@@ -133,37 +155,80 @@ async function unload(): Promise<void> {
 
 interface WhisperGenerationConfig {
   decoder_start_token_id: number;
+  eos_token_id: number;
   lang_to_id: Record<string, number>;
+  task_to_id: Record<AsrTask, number>;
+  no_timestamps_token_id: number;
+  prev_sot_token_id: number;
+}
+
+const whisperConfig = (pipe: AutomaticSpeechRecognitionPipeline): WhisperGenerationConfig =>
+  pipe.model.generation_config as unknown as WhisperGenerationConfig;
+
+/** openai/whisper's no-speech token directly follows <|startofprev|>, in every Whisper vocabulary. */
+const noSpeechToken = (config: WhisperGenerationConfig): number => config.prev_sot_token_id + 1;
+
+function checkSpecialTokens(pipe: AutomaticSpeechRecognitionPipeline): void {
+  const config = whisperConfig(pipe);
+  const name = pipe.tokenizer.decode([noSpeechToken(config)], { skip_special_tokens: false });
+  if (name !== '<|nocaptions|>' && name !== '<|nospeech|>') {
+    throw new Error(`Unexpected no-speech token ${JSON.stringify(name)}`);
+  }
+}
+
+interface FirstStep {
+  /** Most likely language ("en", "hi", ...). */
+  language: string;
+  /** Among languages only, as openai/whisper's detect_language. */
+  englishProb: number;
+  /** Over the whole vocabulary, as openai/whisper's no_speech_prob. */
+  noSpeechProb: number;
 }
 
 /**
- * Transformers.js 4.3.1 doesn't detect the language: with none set it decodes as English. So run
- * one decoder step from <|startoftranscript|> on the first 30 s and take the most likely language
- * token, as openai/whisper's detect_language does.
+ * One decoder step from <|startoftranscript|>: the language and no-speech probabilities, as
+ * openai/whisper reads them. Without `encoder_outputs`, the encoder runs first.
  */
-async function detectLanguage(pipe: AutomaticSpeechRecognitionPipeline, audio: Float32Array) {
-  const { input_features } = (await pipe.processor(
-    audio.subarray(0, WINDOW_SECONDS * ASR_SAMPLE_RATE),
-  )) as { input_features: Tensor };
-  const config = pipe.model.generation_config as unknown as WhisperGenerationConfig;
+async function firstStep(
+  pipe: AutomaticSpeechRecognitionPipeline,
+  input_features: Tensor,
+  encoder_outputs?: Tensor,
+): Promise<FirstStep> {
+  const config = whisperConfig(pipe);
   const decoder_input_ids = new Tensor(
     'int64',
     BigInt64Array.from([BigInt(config.decoder_start_token_id)]),
     [1, 1],
   );
-  const output = (await pipe.model({ input_features, decoder_input_ids })) as { logits: Tensor };
+  const output = (await pipe.model({ input_features, encoder_outputs, decoder_input_ids })) as {
+    logits: Tensor;
+  };
   const logits = output.logits.type === 'float32' ? output.logits : output.logits.to('float32');
   const scores = logits.data as Float32Array;
-  let best = 'en';
-  let bestScore = -Infinity;
-  for (const [token, tokenId] of Object.entries(config.lang_to_id)) {
-    const score = scores[tokenId] ?? -Infinity;
-    if (score > bestScore) {
-      bestScore = score;
-      best = token.slice(2, -2); // "<|hi|>" -> "hi"
-    }
-  }
-  return best;
+  const languages = Object.entries(config.lang_to_id).map(([token, id]) => ({
+    language: token.slice(2, -2), // "<|hi|>" -> "hi"
+    score: scores[id] ?? -Infinity,
+  }));
+  const max = Math.max(...languages.map(({ score }) => score));
+  const total = languages.reduce((sum, { score }) => sum + Math.exp(score - max), 0);
+  const best = languages.reduce((a, b) => (b.score > a.score ? b : a));
+  const english = languages.find(({ language }) => language === 'en');
+  return {
+    language: best.language,
+    englishProb: english ? Math.exp(english.score - max) / total : 0,
+    noSpeechProb: Math.exp(logProbability(scores, noSpeechToken(config))),
+  };
+}
+
+/**
+ * Transformers.js 4.3.1 doesn't detect the language: with none set it decodes as English. So take
+ * the most likely language token from the first 30 s, as openai/whisper's detect_language does.
+ */
+async function detectLanguage(pipe: AutomaticSpeechRecognitionPipeline, audio: Float32Array) {
+  const { input_features } = (await pipe.processor(
+    audio.subarray(0, WINDOW_SECONDS * ASR_SAMPLE_RATE),
+  )) as { input_features: Tensor };
+  return (await firstStep(pipe, input_features)).language;
 }
 
 async function transcribe(
@@ -202,6 +267,157 @@ interface EncoderSession {
 /** <|startoftranscript|> <|en|> <|transcribe|> <|notimestamps|> */
 const PROMPT_TOKENS = 4;
 
+/** Runs the encoder session once and returns its output for generate() to reuse. */
+async function encode(
+  pipe: AutomaticSpeechRecognitionPipeline,
+  input_features: Tensor,
+): Promise<Tensor> {
+  const encoder = (
+    pipe.model as unknown as { sessions: Record<string, EncoderSession | undefined> }
+  ).sessions.model;
+  if (!encoder) throw new Error('Whisper encoder session not found.');
+  const encoded = await encoder.run({ input_features: input_features.ort_tensor });
+  const lastHiddenState = encoded.last_hidden_state;
+  if (!lastHiddenState) throw new Error('Encoder returned no last_hidden_state.');
+  return new Tensor(lastHiddenState);
+}
+
+type Generate = (options: Record<string, unknown>) => Promise<unknown>;
+
+/** Below this, a segment is taken as not English (captions are English only). To be tuned. */
+const ENGLISH_MIN_PROB = 0.25;
+
+/** The four task tokens that start an English transcription without timestamps. */
+const taskTokens = (config: WhisperGenerationConfig): number[] => [
+  config.decoder_start_token_id,
+  config.lang_to_id['<|en|>'] ?? 0,
+  config.task_to_id.transcribe,
+  config.no_timestamps_token_id,
+];
+
+interface Generated {
+  attempt: Attempt;
+  /** Text tokens, without special tokens. */
+  tokens: number[];
+}
+
+/** One decode at `temperature` (0 is greedy) from `init`: the prompt and the task tokens. */
+async function generateOnce(
+  pipe: AutomaticSpeechRecognitionPipeline,
+  inputs: { input_features: Tensor; encoder_outputs: Tensor },
+  init: readonly number[],
+  temperature: number,
+  maxNew: number,
+  interrupt: Interrupt,
+): Promise<Generated> {
+  const config = whisperConfig(pipe);
+  const logprobs = new TokenLogprobs(temperature);
+  const processors = new LogitsProcessorList();
+  processors.push(new GeneratedNoRepeatNGram(NO_REPEAT_NGRAM_SIZE, init.length));
+  processors.push(logprobs);
+  const generate = pipe.model.generate.bind(pipe.model) as Generate;
+  const output = (await generate({
+    inputs: inputs.input_features,
+    encoder_outputs: inputs.encoder_outputs,
+    decoder_input_ids: [...init],
+    max_new_tokens: maxNew,
+    return_timestamps: false,
+    // Sampling keeps Transformers.js's default top_k of 50; openai/whisper samples from all tokens.
+    do_sample: temperature > 0,
+    temperature: temperature > 0 ? temperature : 1,
+    logits_processor: processors,
+    stopping_criteria: [interrupt],
+  })) as Tensor;
+  const generated = ((output.tolist() as bigint[][])[0] ?? []).slice(init.length);
+  const last = generated.at(-1);
+  const endOfText = BigInt(config.eos_token_id);
+  // Whisper's special tokens all come after <|endoftext|>.
+  const tokens = generated.filter((token) => token < endOfText).map(Number);
+  const text = pipe.tokenizer.decode(tokens, { skip_special_tokens: true }).trim();
+  return {
+    attempt: {
+      text,
+      temperature,
+      avgLogprob: logprobs.average(last),
+      compressionRatio: await compressionRatio(text),
+      hitTokenCap: last !== endOfText && generated.length >= maxNew,
+    },
+    tokens,
+  };
+}
+
+type Decoded = Omit<Extract<WorkerResponse, { type: 'decoded' }>, 'type' | 'id'>;
+
+/**
+ * One caption segment, after openai/whisper's transcribe(): one encoder pass, the language and
+ * no-speech probabilities from the first step, then greedy decoding with the guards, retried hotter
+ * on a loop or low confidence. Only text that passed (or was merely doubtful) is returned.
+ */
+async function decode(
+  request: Extract<WorkerRequest, { type: 'decode' }>,
+  interrupt: Interrupt,
+): Promise<Decoded> {
+  const pipe = asr;
+  if (!pipe) throw new Error('No model loaded.');
+  const config = whisperConfig(pipe);
+  const started = performance.now();
+  const { input_features } = (await pipe.processor(request.audio)) as { input_features: Tensor };
+  const featured = performance.now();
+  const encoder_outputs = await encode(pipe, input_features);
+  const encoded = performance.now();
+  const first = await firstStep(pipe, input_features, encoder_outputs);
+  const attempts: AttemptSummary[] = [];
+  const result = (outcome: Decoded['outcome'], promptTokens = 0, kept?: Generated): Decoded => ({
+    outcome,
+    text: kept?.attempt.text ?? '',
+    tokens: kept?.tokens ?? [],
+    language: first.language,
+    englishProb: first.englishProb,
+    noSpeechProb: first.noSpeechProb,
+    promptTokens,
+    attempts,
+    featuresMs: featured - started,
+    encoderMs: encoded - featured,
+    ms: performance.now() - started,
+  });
+
+  if (first.englishProb < ENGLISH_MIN_PROB) {
+    return result(first.noSpeechProb > NO_SPEECH_THRESHOLD ? 'no-speech' : 'not-english');
+  }
+  const prompt = request.prompt?.language === 'en' ? request.prompt.tokens : [];
+  const init = [
+    ...(prompt.length > 0 ? [config.prev_sot_token_id, ...prompt] : []),
+    ...taskTokens(config),
+  ];
+  const maxNew = maxNewTokens(request.audio.length / ASR_SAMPLE_RATE);
+  const temperatures = request.kind === 'partial' ? [0] : TEMPERATURES;
+  const inputs = { input_features, encoder_outputs };
+  let kept: Generated | undefined;
+  let verdict: Verdict = 'ok';
+  for (const temperature of temperatures) {
+    const generated = await generateOnce(pipe, inputs, init, temperature, maxNew, interrupt);
+    if (interrupt.requested) return result('interrupted', prompt.length);
+    verdict = judge(generated.attempt, first.noSpeechProb);
+    const { avgLogprob, compressionRatio: ratio, hitTokenCap } = generated.attempt;
+    attempts.push({ temperature, avgLogprob, compressionRatio: ratio, hitTokenCap, verdict });
+    kept = generated;
+    if (verdict === 'ok' || verdict === 'no-speech') break;
+  }
+  const shown = verdict === 'ok' || verdict === 'low-confidence';
+  return result(verdict, prompt.length, shown ? kept : undefined);
+}
+
+/** Half a second of silence through every stage, so the first real caption runs warm. */
+async function warmUp(pipe: AutomaticSpeechRecognitionPipeline): Promise<void> {
+  const { input_features } = (await pipe.processor(new Float32Array(ASR_SAMPLE_RATE / 2))) as {
+    input_features: Tensor;
+  };
+  const encoder_outputs = await encode(pipe, input_features);
+  await firstStep(pipe, input_features, encoder_outputs);
+  const inputs = { input_features, encoder_outputs };
+  await generateOnce(pipe, inputs, taskTokens(whisperConfig(pipe)), 0, 4, new Interrupt());
+}
+
 /**
  * Times the parts of one English decode separately. The encoder runs on its own session, then
  * generate() decodes from its output (it skips the encoder when `encoder_outputs` is given). The
@@ -216,20 +432,12 @@ async function profile(
   const started = performance.now();
   const { input_features } = (await pipe.processor(audio)) as { input_features: Tensor };
   const featured = performance.now();
-  const encoder = (
-    pipe.model as unknown as { sessions: Record<string, EncoderSession | undefined> }
-  ).sessions.model;
-  if (!encoder) throw new Error('Whisper encoder session not found.');
-  const encoded = await encoder.run({ input_features: input_features.ort_tensor });
+  const encoder_outputs = await encode(pipe, input_features);
   const encoderDone = performance.now();
-  const lastHiddenState = encoded.last_hidden_state;
-  if (!lastHiddenState) throw new Error('Encoder returned no last_hidden_state.');
-  const generate = pipe.model.generate.bind(pipe.model) as (
-    options: Record<string, unknown>,
-  ) => Promise<unknown>;
+  const generate = pipe.model.generate.bind(pipe.model) as Generate;
   const output = (await generate({
     inputs: input_features,
-    encoder_outputs: new Tensor(lastHiddenState),
+    encoder_outputs,
     language: 'en',
     task: 'transcribe',
     max_new_tokens: 224,
@@ -264,6 +472,17 @@ async function handle(request: WorkerRequest): Promise<void> {
     case 'profile':
       post({ type: 'profile', id: request.id, ...(await profile(request.audio)) });
       return;
+    case 'decode': {
+      const interrupt = interrupts.get(request.id) ?? new Interrupt();
+      try {
+        post({ type: 'decoded', id: request.id, ...(await decode(request, interrupt)) });
+      } finally {
+        interrupts.delete(request.id);
+      }
+      return;
+    }
+    case 'interrupt':
+      return;
     case 'unload':
       await unload();
       post({ type: 'unloaded', id: request.id });
@@ -273,6 +492,11 @@ async function handle(request: WorkerRequest): Promise<void> {
 
 // One request at a time: loads and inference share the GPU and the ORT sessions.
 let queue: Promise<void> = Promise.resolve();
+/**
+ * Decodes queued or running, by request id. generate() awaits ORT between steps, so an interrupt
+ * message is handled while a decode runs.
+ */
+const interrupts = new Map<number, Interrupt>();
 
 function onRequest(event: MessageEvent<unknown>): void {
   const request = event.data;
@@ -280,6 +504,12 @@ function onRequest(event: MessageEvent<unknown>): void {
     console.warn('[tabscribe] ASR worker ignored an invalid request');
     return;
   }
+  if (request.type === 'interrupt') {
+    const interrupt = interrupts.get(request.id);
+    if (interrupt) interrupt.requested = true;
+    return;
+  }
+  if (request.type === 'decode') interrupts.set(request.id, new Interrupt());
   queue = queue.then(() =>
     handle(request).catch((error: unknown) => {
       const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);

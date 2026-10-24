@@ -10,6 +10,7 @@ import {
   type ModelKey,
 } from './models';
 import { isThreadCount } from './threads';
+import type { Verdict } from './guards';
 
 export type AsrTask = 'transcribe' | 'translate';
 
@@ -39,7 +40,43 @@ export type WorkerRequest =
    * the encoder session, then greedy decoding from the encoder output.
    */
   | { type: 'profile'; id: number; audio: Float32Array }
+  /**
+   * One caption segment (at most 30 s), English only, with the guards. A partial is a preview:
+   * one greedy attempt, and `interrupt` with the same id stops it at the next decoder step.
+   */
+  | {
+      type: 'decode';
+      id: number;
+      audio: Float32Array;
+      kind: DecodeKind;
+      prompt: DecodePrompt | null;
+    }
+  /** Not queued and not answered: the decode with this id answers, as `interrupted`. */
+  | { type: 'interrupt'; id: number }
   | { type: 'unload'; id: number };
+
+export type DecodeKind = 'final' | 'partial';
+
+export interface DecodePrompt {
+  /** Text tokens of the previous segment's tail (no special tokens). */
+  tokens: number[];
+  /** Used only if the new segment is detected in this language. */
+  language: string;
+}
+
+/** What became of a decode: a guard verdict, or why it wasn't decoded to the end. */
+export type DecodeOutcome = Verdict | 'not-english' | 'interrupted';
+
+export interface AttemptSummary {
+  temperature: number;
+  avgLogprob: number;
+  compressionRatio: number;
+  hitTokenCap: boolean;
+  verdict: Verdict;
+}
+
+/** Most text tokens a prompt may carry; openai/whisper allows 223. */
+export const MAX_PROMPT_TOKENS = 223;
 
 export type GpuInfo =
   | {
@@ -58,8 +95,12 @@ export type GpuInfo =
 export type WorkerResponse =
   | { type: 'gpu-info'; id: number; info: GpuInfo }
   | { type: 'progress'; id: number; file: string; loaded: number; total: number }
-  /** `threads`: what ONNX Runtime runs with (1 without cross-origin isolation). */
-  | { type: 'loaded'; id: number; ms: number; threads: number }
+  /**
+   * `threads`: what ONNX Runtime runs with (1 without cross-origin isolation). `warmMs`: one decode
+   * of silence right after loading, so the first caption doesn't pay for shader compilation and
+   * first-run allocation.
+   */
+  | { type: 'loaded'; id: number; ms: number; threads: number; warmMs: number }
   | {
       type: 'result';
       id: number;
@@ -80,6 +121,25 @@ export type WorkerResponse =
       /** Decoder steps run, including the end-of-text token (excludes the 4 prompt tokens). */
       decoderSteps: number;
       text: string;
+    }
+  | {
+      type: 'decoded';
+      id: number;
+      outcome: DecodeOutcome;
+      /** Empty unless the outcome is ok or low-confidence. */
+      text: string;
+      /** The text's tokens (no special tokens), for the next segment's prompt. */
+      tokens: number[];
+      /** Most likely language, and the probability of English, from one step at the start. */
+      language: string;
+      englishProb: number;
+      noSpeechProb: number;
+      /** Prompt tokens actually used (0 when none was given or the language differed). */
+      promptTokens: number;
+      attempts: AttemptSummary[];
+      featuresMs: number;
+      encoderMs: number;
+      ms: number;
     }
   | { type: 'unloaded'; id: number }
   | { type: 'error'; id: number; message: string };
@@ -103,6 +163,46 @@ const isShortString = (value: unknown, max = 1000): value is string =>
 /** Whisper language codes are 2-3 lower-case letters ("en", "hi", "haw"). */
 export const isLanguageCode = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-z]{2,3}$/.test(value);
+
+/** Whisper's vocabulary has 51 865 entries; text tokens are the ones below the special tokens. */
+const isTokenList = (value: unknown, max: number): value is number[] =>
+  Array.isArray(value) &&
+  value.length <= max &&
+  value.every(
+    (token) => Number.isSafeInteger(token) && Number(token) >= 0 && Number(token) < 51_865,
+  );
+
+const isDecodePrompt = (value: unknown): value is DecodePrompt =>
+  isRecord(value) &&
+  hasExactKeys(value, ['tokens', 'language']) &&
+  isTokenList(value.tokens, MAX_PROMPT_TOKENS) &&
+  value.tokens.length > 0 &&
+  isLanguageCode(value.language);
+
+const isProbability = (value: unknown): value is number =>
+  typeof value === 'number' && value >= 0 && value <= 1;
+
+const VERDICTS: readonly string[] = ['ok', 'no-speech', 'loop', 'low-confidence'];
+const OUTCOMES: readonly string[] = [...VERDICTS, 'not-english', 'interrupted'];
+
+/** Log-probabilities are at most 0; -Infinity means nothing was generated. */
+const isLogprob = (value: unknown): value is number =>
+  typeof value === 'number' && !Number.isNaN(value) && value <= 0;
+
+const isAttemptSummary = (value: unknown): value is AttemptSummary =>
+  isRecord(value) &&
+  hasExactKeys(value, [
+    'temperature',
+    'avgLogprob',
+    'compressionRatio',
+    'hitTokenCap',
+    'verdict',
+  ]) &&
+  isCount(value.temperature) &&
+  isLogprob(value.avgLogprob) &&
+  isCount(value.compressionRatio) &&
+  typeof value.hitTokenCap === 'boolean' &&
+  VERDICTS.includes(value.verdict as string);
 
 const isDtypeSpec = (value: unknown): value is DtypeSpec =>
   isRecord(value) &&
@@ -132,6 +232,17 @@ export function isWorkerRequest(value: unknown): value is WorkerRequest {
         value.audio.length <= MAX_AUDIO_SAMPLES &&
         (value.task === 'transcribe' || value.task === 'translate') &&
         (value.language === null || isLanguageCode(value.language))
+      );
+    case 'interrupt':
+      return hasExactKeys(value, ['type', 'id']);
+    case 'decode':
+      return (
+        hasExactKeys(value, ['type', 'id', 'audio', 'kind', 'prompt']) &&
+        value.audio instanceof Float32Array &&
+        value.audio.length > 0 &&
+        value.audio.length <= MAX_WINDOW_SAMPLES &&
+        (value.kind === 'final' || value.kind === 'partial') &&
+        (value.prompt === null || isDecodePrompt(value.prompt))
       );
     case 'profile':
       return (
@@ -190,9 +301,42 @@ export function isWorkerResponse(value: unknown): value is WorkerResponse {
       );
     case 'loaded':
       return (
-        hasExactKeys(value, ['type', 'id', 'ms', 'threads']) &&
+        hasExactKeys(value, ['type', 'id', 'ms', 'threads', 'warmMs']) &&
         isCount(value.ms) &&
-        isThreadCount(value.threads)
+        isThreadCount(value.threads) &&
+        isCount(value.warmMs)
+      );
+    case 'decoded':
+      return (
+        hasExactKeys(value, [
+          'type',
+          'id',
+          'outcome',
+          'text',
+          'tokens',
+          'language',
+          'englishProb',
+          'noSpeechProb',
+          'promptTokens',
+          'attempts',
+          'featuresMs',
+          'encoderMs',
+          'ms',
+        ]) &&
+        OUTCOMES.includes(value.outcome as string) &&
+        isShortString(value.text, 10_000) &&
+        isTokenList(value.tokens, 448) &&
+        isLanguageCode(value.language) &&
+        isProbability(value.englishProb) &&
+        isProbability(value.noSpeechProb) &&
+        Number.isSafeInteger(value.promptTokens) &&
+        isCount(value.promptTokens) &&
+        Array.isArray(value.attempts) &&
+        value.attempts.length <= 8 &&
+        value.attempts.every(isAttemptSummary) &&
+        isCount(value.featuresMs) &&
+        isCount(value.encoderMs) &&
+        isCount(value.ms)
       );
     case 'result':
       return (
