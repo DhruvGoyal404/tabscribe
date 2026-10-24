@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Checks the production build in dist/ after `npm run build`:
-// - the manifest keeps exactly the approved permissions, no host permissions, and the approved CSP;
+// - the manifest keeps exactly the approved permissions, no host permissions, the approved CSP and
+//   cross-origin isolation;
 // - nothing from the dev-only bench (page, fixtures, ONNX Runtime, model files) leaked in.
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -11,6 +12,11 @@ const PERMISSIONS = ['activeTab', 'tabCapture', 'offscreen', 'scripting', 'stora
 const CSP =
   "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; " +
   "connect-src 'self' https://huggingface.co https://*.hf.co;";
+// Cross-origin isolation, for multithreaded ONNX Runtime WASM.
+const ISOLATION = {
+  cross_origin_embedder_policy: 'require-corp',
+  cross_origin_opener_policy: 'same-origin',
+};
 // Until P3b wires ASR into the offscreen document, its workers and models are bench-only.
 const FORBIDDEN = [
   /(^|\/)bench(\/|\.|-)/,
@@ -38,6 +44,11 @@ if (manifest.content_security_policy?.extension_pages !== CSP) {
     `extension_pages CSP is ${JSON.stringify(manifest.content_security_policy?.extension_pages)}`,
   );
 }
+for (const [key, value] of Object.entries(ISOLATION)) {
+  if (manifest[key]?.value !== value) {
+    problems.push(`${key} is ${JSON.stringify(manifest[key])}, expected ${JSON.stringify(value)}`);
+  }
+}
 
 const files = (await readdir(DIST, { recursive: true, withFileTypes: true }))
   .filter((entry) => entry.isFile())
@@ -55,5 +66,5 @@ if (problems.length > 0) {
   process.exit(1);
 }
 console.log(
-  `✓ dist/ (${String(files.length)} files): approved permissions and CSP, no dev-only files.`,
+  `✓ dist/ (${String(files.length)} files): approved permissions, CSP and isolation, no dev-only files.`,
 );
