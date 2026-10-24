@@ -62,8 +62,9 @@ declarations, so DOM APIs can't leak into code running on the audio thread.
 starting tab capture`. See [p3b-streaming.md](./p3b-streaming.md#cross-origin-isolation-multithreaded-wasm). The
 > activeTab finding below still holds: the popup is the invoked context.
 
-**`chrome.tabCapture.getMediaStreamId({ targetTabId })` called in the service worker, after a message
-from the popup, works.** No popup-side fallback is needed.
+**Before isolation, `chrome.tabCapture.getMediaStreamId({ targetTabId })` called in the service
+worker, after a message from the popup, worked**, so P2 needed no popup-side request. That part no
+longer holds (see the note above): the popup now requests the id.
 
 Why: the requirement isn't a transient user gesture that has to survive the message hop. It's an
 **invocation grant**. The [tabCapture docs](https://developer.chrome.com/docs/extensions/reference/api/tabCapture)
