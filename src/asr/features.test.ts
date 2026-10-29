@@ -91,14 +91,19 @@ describe('skipPaddingFrames', () => {
   ];
   // ONNX Runtime's matmul (the mel projection) rounds a few values differently with fewer columns.
   // One float32 step near 1 is 1.2e-7; features span about -1.5 to 1.5.
-  it.each(cases)('matches the full extractor on %s', async (_, clip) => {
-    const expected = (await full(clip)).input_features;
-    const actual = (await patched(clip)).input_features;
-    expect(actual.dims).toEqual(expected.dims);
-    let largest = 0;
-    expected.data.forEach((value, i) => {
-      largest = Math.max(largest, Math.abs(value - (actual.data[i] ?? NaN)));
-    });
-    expect(largest).toBeLessThanOrEqual(5e-7);
-  });
+  // Two full 30 s extractions per case: seconds each, more under a parallel test run.
+  it.each(cases)(
+    'matches the full extractor on %s',
+    async (_, clip) => {
+      const expected = (await full(clip)).input_features;
+      const actual = (await patched(clip)).input_features;
+      expect(actual.dims).toEqual(expected.dims);
+      let largest = 0;
+      expected.data.forEach((value, i) => {
+        largest = Math.max(largest, Math.abs(value - (actual.data[i] ?? NaN)));
+      });
+      expect(largest).toBeLessThanOrEqual(5e-7);
+    },
+    30_000,
+  );
 });
