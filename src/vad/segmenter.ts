@@ -4,8 +4,10 @@
 // Hysteresis as in Silero's get_speech_timestamps: speech starts when the probability reaches
 // `startThreshold`, and a pause starts when it falls below `endThreshold`; values in between keep
 // whichever state is current. A segment ends after `minSilenceMs` of pause, padded by `padMs` on
-// both sides. Long speech without a pause is cut at `maxSegmentMs`, and the next segment repeats the
-// last `overlapMs` so a word split by the cut is heard whole once (the ASR side de-duplicates).
+// both sides. Long speech without a pause is cut when it reaches `maxSegmentMs`, after the quietest
+// frame of its last `cutSearchMs` (as Silero's get_speech_timestamps splits at its last silence),
+// so the cut tends to fall between words. The next segment repeats the last `overlapMs` before the
+// cut, so a word the cut splits anyway is heard whole once (the ASR side de-duplicates).
 
 export interface SegmenterOptions {
   sampleRate: number;
@@ -19,6 +21,8 @@ export interface SegmenterOptions {
   padMs: number;
   /** Forced cut for speech without pauses. Bounds the worst-case latency. */
   maxSegmentMs: number;
+  /** A forced cut goes after the quietest frame of this last stretch of the segment. */
+  cutSearchMs: number;
   /** Repeated at the start of the segment that follows a forced cut. */
   overlapMs: number;
   /** First partial snapshot of a growing segment, measured from speech start. */
@@ -34,6 +38,7 @@ export const DEFAULT_SEGMENTER: SegmenterOptions = {
   minSilenceMs: 500,
   padMs: 200,
   maxSegmentMs: 10_000,
+  cutSearchMs: 2_000,
   overlapMs: 2_000,
   firstPartialMs: 1_000,
   partialIntervalMs: 2_000,
@@ -94,6 +99,27 @@ function tail(frames: readonly Float32Array[], samples: number): Float32Array[] 
 const length = (frames: readonly Float32Array[]): number =>
   frames.reduce((sum, frame) => sum + frame.length, 0);
 
+const meanSquare = (frame: Float32Array): number =>
+  frame.reduce((sum, sample) => sum + sample * sample, 0) / Math.max(1, frame.length);
+
+/** Index of the quietest of the frames covering the last `samples`; the latest one on a tie. */
+function quietest(frames: readonly Float32Array[], samples: number): number {
+  let best = frames.length - 1;
+  let bestLevel = Infinity;
+  let covered = 0;
+  for (let i = frames.length - 1; i >= 0 && covered < samples; i--) {
+    const frame = frames[i];
+    if (!frame) break;
+    const level = meanSquare(frame);
+    if (level < bestLevel) {
+      best = i;
+      bestLevel = level;
+    }
+    covered += frame.length;
+  }
+  return best;
+}
+
 export class Segmenter {
   private readonly options: SegmenterOptions;
   private readonly samples: (ms: number) => number;
@@ -151,7 +177,7 @@ export class Segmenter {
       return this.endOnPause(this.pauseStart, frameEnd);
     }
     if (frameEnd - this.segmentStart >= this.samples(o.maxSegmentMs)) {
-      return [this.cut(frameEnd)];
+      return [this.cut()];
     }
     if (frameEnd >= this.nextPartial) {
       this.nextPartial += this.samples(o.partialIntervalMs);
@@ -197,14 +223,21 @@ export class Segmenter {
     return events;
   }
 
-  private cut(frameEnd: number): SegmentEvent {
+  private cut(): SegmentEvent {
+    const kept = quietest(this.frames, this.samples(this.options.cutSearchMs)) + 1;
+    const after = this.frames.slice(kept);
+    this.frames = this.frames.slice(0, kept);
+    const cutAt = this.segmentStart + length(this.frames);
+    const pause = this.pauseStart;
     // Always emitted: speech has been going for maxSegmentMs.
-    const event = this.emit(this.pauseStart ?? frameEnd, frameEnd, 'max-length');
+    const event = this.emit(pause !== null && pause < cutAt ? pause : cutAt, cutAt, 'max-length');
     const carried = tail(this.frames, this.samples(this.options.overlapMs));
-    this.frames = carried;
+    this.frames = [...carried, ...after];
     this.overlap = length(carried);
-    this.segmentStart = frameEnd - this.overlap;
+    this.segmentStart = cutAt - this.overlap;
     this.startSegment(this.segmentStart);
+    // A pause that began after the cut belongs to the new segment.
+    if (pause !== null && pause >= cutAt) this.pauseStart = pause;
     return event;
   }
 
