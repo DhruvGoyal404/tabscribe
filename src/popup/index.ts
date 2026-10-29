@@ -72,8 +72,10 @@ function render(): void {
   const busy = state.status === 'starting' || state.status === 'stopping';
 
   ui.status.textContent = describe(state);
-  // The button names the download, so clicking it is the agreement to that download.
-  const download = planned && !planned.cached ? `Download ${mb(planBytes(planned.plan))} and ` : '';
+  // The button names the download, so clicking it is the agreement to that download. Once this
+  // tab's captions are running there's nothing to agree to.
+  const offerDownload = planned !== null && !planned.cached && !capturingThisTab;
+  const download = planned && offerDownload ? `Download ${mb(planBytes(planned.plan))} and ` : '';
   const action = state.status === 'capturing' && !capturingThisTab ? 'capture this tab' : 'start';
   ui.start.textContent = download ? download + action : capitalise(action);
   ui.start.disabled = activeTabId === undefined || busy || capturingThisTab || !planned;
@@ -88,7 +90,7 @@ function render(): void {
 
   if (planned) {
     ui.plan.textContent = `Captions: ${describePlan(planned.plan)}. ${capitalise(planned.plan.reason)}.`;
-    ui.consent.hidden = planned.cached;
+    ui.consent.hidden = !offerDownload;
     ui.consent.textContent =
       `Captions need a one-time ${mb(planBytes(planned.plan))} download of the ${CAPTION_MODEL} ` +
       'speech model from huggingface.co. It stays on this device, and speech never leaves it.';
@@ -135,6 +137,7 @@ function syncSessionPort(): void {
         if (message.type === 'captions/status') {
           ui.captionStatus.hidden = false;
           ui.captionStatus.textContent = describeStatus(message.status);
+          if (message.status.state === 'listening') modelLoaded(message.status.plan);
         } else showCaption(message.caption);
       }
     });
@@ -149,6 +152,14 @@ function syncSessionPort(): void {
     sessionPort.disconnect();
     sessionPort = null;
   }
+}
+
+/** A model that loaded is in the cache, so starting with that plan again needs no download. */
+function modelLoaded(plan: CaptionPlan): void {
+  // Each device has one dtype (isCaptionPlan), so the device names the files.
+  if (planned?.plan.device !== plan.device) return;
+  planned = { ...planned, cached: true };
+  render();
 }
 
 /** Plans the caption backend here: the offscreen document runs on the same GPU. */
