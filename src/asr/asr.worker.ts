@@ -285,8 +285,12 @@ async function encode(
 
 type Generate = (options: Record<string, unknown>) => Promise<unknown>;
 
-/** Below this, a segment is taken as not English (captions are English only). To be tuned. */
-const ENGLISH_MIN_PROB = 0.25;
+/**
+ * Below this, a segment is taken as not English (captions are English only). Measured in piece 4:
+ * accented parliamentary English went as low as 0.27, Hindi as high as 0.14 (French and German
+ * 0.08). 0.2 is near the geometric middle; the margin is thin on both sides.
+ */
+const ENGLISH_MIN_PROB = 0.2;
 
 /** The four task tokens that start an English transcription without timestamps. */
 const taskTokens = (config: WhisperGenerationConfig): number[] => [
