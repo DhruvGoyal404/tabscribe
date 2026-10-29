@@ -21,7 +21,7 @@ export interface SegmenterOptions {
   padMs: number;
   /** Forced cut for speech without pauses. Bounds the worst-case latency. */
   maxSegmentMs: number;
-  /** A forced cut goes after the quietest frame of this last stretch of the segment. */
+  /** A forced cut goes after the quietest frame of this last stretch of the segment; 0 cuts at the maximum. */
   cutSearchMs: number;
   /** Repeated at the start of the segment that follows a forced cut. */
   overlapMs: number;

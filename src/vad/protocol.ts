@@ -23,6 +23,8 @@ export type SegmenterTuning = Partial<Pick<SegmenterOptions, (typeof TUNABLE)[nu
 /** Bounds for tunable values: 50 ms to 30 s (Whisper's window). */
 const MIN_TUNING_MS = 50;
 const MAX_TUNING_MS = 30_000;
+/** These may also be 0: a hard cut at the maximum, and no overlap after it. */
+const MAY_BE_ZERO: readonly string[] = ['cutSearchMs', 'overlapMs'];
 
 export type VadRequest =
   | {
@@ -83,8 +85,7 @@ function isTuning(value: unknown): value is SegmenterTuning {
     ([key, ms]) =>
       (TUNABLE as readonly string[]).includes(key) &&
       typeof ms === 'number' &&
-      ms >= MIN_TUNING_MS &&
-      ms <= MAX_TUNING_MS,
+      ((ms === 0 && MAY_BE_ZERO.includes(key)) || (ms >= MIN_TUNING_MS && ms <= MAX_TUNING_MS)),
   );
 }
 
