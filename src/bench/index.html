@@ -169,15 +169,10 @@
       <p class="note">
         Streams each fixture through the VAD, then decodes its segments in order with the guards
         (loops, low confidence, no-speech, English only), dropping the words an overlap repeats.
-        Each run goes twice, without and with the previous-text prompt, at the default maximum
-        segment and at the one below, which forces cuts. Needs a loaded model.
+        English fixtures run four variants: the defaults (quiet cut, 2 s overlap, no prompt), the
+        previous-text prompt, a hard cut at the maximum, and no overlap. The others should show
+        nothing, so they run the defaults and count the words shown. Needs a loaded model.
       </p>
-      <div class="controls">
-        <label
-          >Forced-cut max segment (ms)
-          <input id="stream-max" type="number" min="1000" max="30000" step="500" value="4000"
-        /></label>
-      </div>
       <div class="buttons">
         <button id="run-stream" type="button" disabled>Run streaming captions</button>
         <button id="clear-stream" type="button">Clear streaming results</button>
@@ -188,12 +183,13 @@
             <tr>
               <th>Config</th>
               <th>Fixture</th>
-              <th>Max segment</th>
-              <th>Prompt</th>
+              <th>Variant</th>
               <th>Segments</th>
               <th>Forced cuts</th>
               <th>Prompted</th>
               <th>WER</th>
+              <th>Words shown</th>
+              <th>P(en) min / median / max</th>
               <th>Loops caught</th>
               <th>Loops shown</th>
               <th>Retries</th>

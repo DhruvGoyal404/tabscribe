@@ -61,7 +61,7 @@ describe('decodeStream', () => {
   it('drops the words an overlap repeats, and joins the captions', async () => {
     const { decode } = fake([
       decoded('He has grave doubts whether Sir Frederick'),
-      decoded('Sir Frederick Leighton’s work is really Greek.'),
+      decoded('Sir Frederick Leighton’s work is really Greek.', 'ok', { englishProb: 0.8 }),
     ]);
     const run = await decodeStream(
       [final(0, 0, 'max-length'), final(1, 128_000, 'silence', 32_000)],
@@ -72,6 +72,7 @@ describe('decodeStream', () => {
       'He has grave doubts whether Sir Frederick Leighton’s work is really Greek.',
     );
     expect(run.stats.forcedCuts).toBe(1);
+    expect(run.stats.englishProbs).toEqual([0.99, 0.8]);
   });
 
   it('prompts only after a forced cut that passed, and only when asked to', async () => {
