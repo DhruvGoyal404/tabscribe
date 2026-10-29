@@ -66,6 +66,19 @@ const DTYPE_SUFFIX: Record<Dtype, string> = {
 };
 
 export const HF_HOST = 'https://huggingface.co/';
+/** Cache API bucket Transformers.js stores model files in, keyed by modelFileUrls. */
+export const MODEL_CACHE = 'transformers-cache';
+
+/** Whether every file a load would fetch is already cached (false if the Cache API fails). */
+export async function isCached(key: ModelKey, dtype: DtypeSpec): Promise<boolean> {
+  try {
+    const cache = await caches.open(MODEL_CACHE);
+    const hits = await Promise.all(modelFileUrls(key, dtype).map((url) => cache.match(url)));
+    return hits.every((hit) => hit !== undefined);
+  } catch {
+    return false;
+  }
+}
 
 /** Every file a load fetches, as the URLs Transformers.js requests (and uses as cache keys). */
 export function modelFileUrls(key: ModelKey, dtype: DtypeSpec): string[] {
@@ -80,6 +93,19 @@ export function modelFileUrls(key: ModelKey, dtype: DtypeSpec): string[] {
     `onnx/encoder_model${DTYPE_SUFFIX[dtype.encoder]}.onnx`,
     `onnx/decoder_model_merged${DTYPE_SUFFIX[dtype.decoder]}.onnx`,
   ].map((file) => base + file);
+}
+
+/**
+ * `url` at the pinned revision. Transformers.js 4.3.1 probes some files (whether they exist, and
+ * their size) without passing the revision, so those requests name `main`, a moving branch.
+ */
+export function pinnedUrl(url: string): string {
+  for (const { id, revision } of Object.values(MODELS) as ModelInfo[]) {
+    const unpinned = `${HF_HOST}${id}/resolve/main/`;
+    if (url.startsWith(unpinned))
+      return `${HF_HOST}${id}/resolve/${revision}/${url.slice(unpinned.length)}`;
+  }
+  return url;
 }
 
 export function downloadBytes(key: ModelKey, dtype: DtypeSpec): number {
