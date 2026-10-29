@@ -94,12 +94,13 @@ describe('isSegmentEvent', () => {
     overlapSamples: 0,
     audio: new Float32Array(100),
   };
-  const partial = { type: 'partial', segmentId: 3, startSample: 1_000, endSample: 1_050, audio: new Float32Array(50) };
+  const partial = { type: 'partial', segmentId: 3, startSample: 1_000, endSample: 1_050, overlapSamples: 0, audio: new Float32Array(50) };
 
   it('accepts finals and partials', () => {
     expect(isSegmentEvent(final)).toBe(true);
     expect(isSegmentEvent({ ...final, reason: 'max-length', overlapSamples: 20 })).toBe(true);
     expect(isSegmentEvent(partial)).toBe(true);
+    expect(isSegmentEvent({ ...partial, overlapSamples: 50 })).toBe(true);
   });
 
   it.each([
@@ -108,6 +109,8 @@ describe('isSegmentEvent', () => {
     ['an unknown reason', { ...final, reason: 'timeout' }],
     ['an overlap longer than the audio', { ...final, overlapSamples: 101 }],
     ['a partial with final-only fields', { ...partial, reason: 'silence' }],
+    ['a partial without its overlap', { type: 'partial', segmentId: 3, startSample: 1_000, endSample: 1_050, audio: new Float32Array(50) }],
+    ['a partial overlap longer than the audio', { ...partial, overlapSamples: 51 }],
     ['more than one Whisper window', { ...final, endSample: 1_000 + 480_001, audio: new Float32Array(480_001) }],
   ])('rejects %s', (_label, event) => {
     expect(isSegmentEvent(event)).toBe(false);
@@ -125,6 +128,7 @@ describe('isSegmentPortMessage', () => {
         segmentId: 0,
         startSample: 0,
         endSample: 10,
+        overlapSamples: 0,
         audio: new Float32Array(10),
       }),
     ).toBe(true);

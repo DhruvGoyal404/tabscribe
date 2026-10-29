@@ -51,6 +51,8 @@ export type SegmentEvent =
       segmentId: number;
       startSample: number;
       endSample: number;
+      /** Leading samples repeated from the previous segment after a forced cut. */
+      overlapSamples: number;
       audio: Float32Array;
     }
   | {
@@ -159,6 +161,7 @@ export class Segmenter {
           segmentId: this.nextId,
           startSample: this.segmentStart,
           endSample: frameEnd,
+          overlapSamples: this.overlap,
           audio: concat(this.frames),
         },
       ];

@@ -9,7 +9,8 @@
 //   final waits at most one decoder step. A partial's caption is never shown after its final.
 // - On WASM the encoder costs seconds per call whatever the length, so finals that queued behind a
 //   busy worker are decoded as one call (up to 12 s), and there are no partials.
-// - Overlap repeats are dropped and the restricted previous-text prompt is applied (context.ts).
+// - Overlap repeats are dropped, from partials as well as finals, and the restricted previous-text
+//   prompt is applied (context.ts).
 import { ASR_SAMPLE_RATE } from './resample';
 import { dropRepeatedPrefix, PromptContext } from './context';
 import type { DecodeKind, DecodePrompt, WorkerResponse } from './protocol';
@@ -113,7 +114,7 @@ export class CaptionScheduler {
     else {
       const segmentId = job.segmentIds[0] ?? -1;
       if (shows(result) && !this.finalised.has(segmentId)) {
-        this.onCaption({ type: 'partial', segmentId, text: result.text });
+        this.onCaption({ type: 'partial', segmentId, text: this.newText(job, result) });
       }
     }
     this.pump();
@@ -124,12 +125,15 @@ export class CaptionScheduler {
     return !this.running && this.finals.length === 0 && !this.partial;
   }
 
+  /** The result's text without the words its overlap repeats from the previous final. */
+  private newText(job: DecodeJob, result: Decoded): string {
+    return job.overlapSamples > 0
+      ? dropRepeatedPrefix(this.previousText, result.text)
+      : result.text;
+  }
+
   private finish(job: DecodeJob, result: Decoded): void {
-    let text = '';
-    if (shows(result)) {
-      text =
-        job.overlapSamples > 0 ? dropRepeatedPrefix(this.previousText, result.text) : result.text;
-    }
+    const text = shows(result) ? this.newText(job, result) : '';
     this.onCaption({
       type: 'final',
       segmentIds: job.segmentIds,
@@ -216,7 +220,7 @@ export class CaptionScheduler {
       startSample: partial.startSample,
       endSample: partial.endSample,
       reason: null,
-      overlapSamples: 0,
+      overlapSamples: partial.overlapSamples,
     };
   }
 }

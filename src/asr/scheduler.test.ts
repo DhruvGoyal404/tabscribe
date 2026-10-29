@@ -26,11 +26,17 @@ const final = (
   audio: Float32Array.from({ length: samples }, (_, i) => segmentId * 1000 + i),
 });
 
-const partial = (segmentId: number, startSample: number, samples: number): SegmentEvent => ({
+const partial = (
+  segmentId: number,
+  startSample: number,
+  samples: number,
+  overlapSamples = 0,
+): SegmentEvent => ({
   type: 'partial',
   segmentId,
   startSample,
   endSample: startSample + samples,
+  overlapSamples,
   audio: new Float32Array(samples),
 });
 
@@ -189,6 +195,21 @@ describe('CaptionScheduler', () => {
       'He has grave doubts whether Sir Frederick',
       'Leighton’s work is Greek.',
     ]);
+  });
+
+  it('drops the words the overlap repeats from partials too', () => {
+    const { scheduler, job, captions } = setup({ ...WEBGPU, prompting: false });
+    scheduler.push(final(0, 0, 160_000, 'max-length'));
+    scheduler.onDecoded(answer(job(0), '...just the ritual of cracking something open.'));
+    scheduler.push(partial(1, 128_000, 48_000, 32_000));
+    scheduler.onDecoded(answer(job(1), 'of cracking something open and sharing it'));
+    expect(captions.at(-1)).toEqual({ type: 'partial', segmentId: 1, text: 'and sharing it' });
+    // A partial after a natural pause has no overlap, so nothing is dropped.
+    scheduler.push(final(1, 128_000, 64_000, 'silence', 32_000));
+    scheduler.onDecoded(answer(job(2), 'of cracking something open and sharing it with friends'));
+    scheduler.push(partial(2, 200_000, 32_000));
+    scheduler.onDecoded(answer(job(3), 'with friends we'));
+    expect(captions.at(-1)).toEqual({ type: 'partial', segmentId: 2, text: 'with friends we' });
   });
 
   it('does not prompt when prompting is off, or after a dropped decode', () => {
