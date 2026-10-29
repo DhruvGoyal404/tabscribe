@@ -11,6 +11,7 @@ import { CaptionScheduler, type DecodeJob } from '../asr/scheduler';
 import type { Caption, CaptionStatus } from '../shared/captions';
 import { CAPTURE_PROCESSOR } from '../shared/chunker';
 import { describeError } from '../shared/messages';
+import { DownloadRate } from './download-rate';
 import { isSegmentPortMessage, isVadResponse, type VadKind } from '../vad/protocol';
 
 export interface CaptionEvents {
@@ -89,12 +90,14 @@ export class CaptionPipeline {
   private load(allowDownload: boolean): Promise<void> {
     const totalBytes = allowDownload ? planBytes(this.plan) : 0;
     const files = new Map<string, number>();
+    const rate = new DownloadRate();
     this.events.status({
       state: 'loading',
       plan: this.plan,
       downloading: allowDownload,
       loadedBytes: 0,
       totalBytes,
+      bytesPerSecond: null,
     });
     return new Promise((resolve, reject) => {
       this.asr.onerror = (event) => {
@@ -112,6 +115,7 @@ export class CaptionPipeline {
             downloading: allowDownload,
             loadedBytes: Math.min(loadedBytes, totalBytes),
             totalBytes,
+            bytesPerSecond: rate.update(performance.now(), loadedBytes),
           });
         } else if (response.type === 'loaded') resolve();
         else if (response.type === 'error' && response.id === LOAD_ID) {
