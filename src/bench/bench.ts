@@ -8,6 +8,7 @@ import {
   isDevice,
   isDtype,
   isModelKey,
+  MODEL_CACHE,
   MODEL_KEYS,
   MODELS,
   modelFileUrls,
@@ -40,8 +41,6 @@ import { DEFAULT_SEGMENTER } from '../vad/segmenter';
 import { decodeStream, type StreamRun } from './stream';
 import { runVad, type VadRun } from './vad-run';
 
-/** Cache API bucket Transformers.js stores model files in. */
-const MODEL_CACHE = 'transformers-cache';
 /** Fixtures are decoded at a typical tab-capture rate and resampled like live audio will be. */
 const CAPTURE_RATE = 48_000;
 const RESULTS_KEY = 'tabscribe-bench-results';

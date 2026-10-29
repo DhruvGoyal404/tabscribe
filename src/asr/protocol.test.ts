@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { downloadBytes, MODEL_KEYS, MODELS, modelFileUrls } from './models';
+import { downloadBytes, MODEL_KEYS, MODELS, modelFileUrls, pinnedUrl } from './models';
 import {
   isLanguageCode,
   isWorkerRequest,
@@ -150,6 +150,23 @@ describe('isLanguageCode', () => {
 });
 
 describe('model catalogue', () => {
+  it('pins a request for main to the catalogue revision', () => {
+    const base = 'https://huggingface.co/onnx-community/whisper-base/resolve/';
+    expect(pinnedUrl(`${base}main/tokenizer_config.json`)).toBe(
+      `${base}${MODELS['whisper-base'].revision}/tokenizer_config.json`,
+    );
+    expect(pinnedUrl(`${base}main/onnx/encoder_model_fp16.onnx`)).toBe(
+      `${base}${MODELS['whisper-base'].revision}/onnx/encoder_model_fp16.onnx`,
+    );
+  });
+
+  it('leaves pinned and unrelated URLs alone', () => {
+    const [pinned = ''] = modelFileUrls('whisper-tiny', { encoder: 'q8', decoder: 'q8' });
+    expect(pinnedUrl(pinned)).toBe(pinned);
+    const other = 'https://huggingface.co/someone/whisper-base/resolve/main/config.json';
+    expect(pinnedUrl(other)).toBe(other);
+  });
+
   it('pins every model to a full commit SHA', () => {
     for (const key of MODEL_KEYS) {
       expect(MODELS[key].revision).toMatch(/^[0-9a-f]{40}$/);

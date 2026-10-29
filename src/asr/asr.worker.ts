@@ -9,7 +9,8 @@
 //   otherwise point ORT at jsDelivr, so wasmPaths is set before any session is created.
 // - Model files are cached with the Cache API (`transformers-cache`), keyed by their pinned URL.
 // - Nothing is downloaded unless the load request allows it (an explicit user action). Every
-//   request Transformers.js makes goes through env.fetch; cache hits don't.
+//   request Transformers.js makes goes through env.fetch below, which also pins it and answers
+//   it from the cache when it can, so a cached start makes no network request.
 //
 // Threads: when the extension is cross-origin isolated, ORT's WASM backend starts its pthreads as
 // module workers from this same script (import.meta.url) named "em-pthread". Those copies only run
@@ -36,7 +37,7 @@ import {
   type Attempt,
   type Verdict,
 } from './guards';
-import { HF_HOST, MODELS } from './models';
+import { HF_HOST, MODEL_CACHE, MODELS, pinnedUrl } from './models';
 import {
   isWorkerRequest,
   type AsrTask,
@@ -58,11 +59,17 @@ env.experimental_useCrossOriginStorage = false;
 /** Set per load from its request. */
 let downloadsAllowed = false;
 const networkFetch = env.fetch;
-env.fetch = (input, init) => {
-  if (!downloadsAllowed) {
-    return Promise.reject(new Error(`ModelNotDownloaded: ${String(input)} isn't cached`));
-  }
-  return networkFetch(input, init);
+// Every request Transformers.js makes, pinned to our revision (some of its probes name `main`),
+// answered from the model cache when possible, and refused unless this load may download.
+env.fetch = async (input, init) => {
+  const url = pinnedUrl(String(input));
+  const cached = await caches
+    .open(MODEL_CACHE)
+    .then((cache) => cache.match(url))
+    .catch(() => undefined);
+  if (cached) return cached;
+  if (!downloadsAllowed) throw new Error(`ModelNotDownloaded: ${url} isn't cached`);
+  return (await networkFetch(url, init)) as Response;
 };
 const onnxWasm = env.backends.onnx.wasm;
 if (onnxWasm) onnxWasm.wasmPaths = { wasm: new URL(ortWasmUrl, self.location.href).href };
