@@ -203,6 +203,52 @@
       <div id="stream-texts"></div>
     </section>
 
+    <section aria-labelledby="live-heading">
+      <h2 id="live-heading">Live captions</h2>
+      <p class="note">
+        Plays one fixture in real time through the VAD worker and the caption scheduler, with the
+        extension's options for the loaded device (partials on WebGPU, merged finals on WASM). A
+        final's delay runs from where its speech ended (the pause, or the forced cut) to when it's
+        shown; a partial's from the end of the audio it previews. Memory is the page's and its
+        workers' JS and WASM heaps after the run (GPU buffers aren't counted). Keep this window in
+        front: background tabs slow timers down. Needs a loaded model.
+      </p>
+      <div class="controls">
+        <label
+          >Fixture
+          <select id="live-fixture"></select
+        ></label>
+      </div>
+      <div class="buttons">
+        <button id="run-live" type="button" disabled>Run live captions</button>
+        <button id="clear-live" type="button">Clear live results</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Config</th>
+              <th>Fixture</th>
+              <th>Segments</th>
+              <th>Finals shown</th>
+              <th>Final p50 (s)</th>
+              <th>Final p95 (s)</th>
+              <th>Final max (s)</th>
+              <th>Partials</th>
+              <th>Partial p50 (s)</th>
+              <th>Partial p95 (s)</th>
+              <th>WER</th>
+              <th>Words shown</th>
+              <th>Memory</th>
+              <th>Run (s)</th>
+            </tr>
+          </thead>
+          <tbody id="live-results"></tbody>
+        </table>
+      </div>
+      <div id="live-texts"></div>
+    </section>
+
     <script type="module" src="./bench.ts"></script>
   </body>
 </html>
