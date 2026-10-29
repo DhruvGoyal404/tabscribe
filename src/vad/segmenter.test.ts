@@ -101,6 +101,20 @@ describe('Segmenter', () => {
     expect(events[1]?.audio.subarray(0, 200)).toEqual(events[0]?.audio.subarray(800, 1000));
   });
 
+  it('marks the overlap on the partials after a forced cut too', () => {
+    const snapshots = partials(run([...seconds(14, 0.9), ...seconds(1, 0)]));
+    expect(snapshots.map((e) => [e.segmentId, e.startSample, e.overlapSamples])).toEqual([
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+      [1, 800, 200],
+      [1, 800, 200],
+      [1, 800, 200],
+    ]);
+  });
+
   it('emits growing partials: first at 1 s, then every 2 s', () => {
     const events = run([...seconds(6, 0.9), ...seconds(1, 0)]);
     const snapshots = partials(events);

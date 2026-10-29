@@ -171,11 +171,20 @@ export function isSegmentEvent(value: unknown): value is SegmentEvent {
   ) {
     return false;
   }
+  const { overlapSamples } = value;
+  if (!isSampleIndex(overlapSamples) || overlapSamples > audio.length) return false;
   switch (value.type) {
     case 'partial':
-      return hasExactKeys(value, ['type', 'segmentId', 'startSample', 'endSample', 'audio']);
+      return hasExactKeys(value, [
+        'type',
+        'segmentId',
+        'startSample',
+        'endSample',
+        'overlapSamples',
+        'audio',
+      ]);
     case 'final': {
-      const { speechEndSample, reason, overlapSamples } = value;
+      const { speechEndSample, reason } = value;
       return (
         hasExactKeys(value, [
           'type',
@@ -188,9 +197,7 @@ export function isSegmentEvent(value: unknown): value is SegmentEvent {
           'audio',
         ]) &&
         isSampleIndex(speechEndSample) &&
-        (END_REASONS as readonly unknown[]).includes(reason) &&
-        isSampleIndex(overlapSamples) &&
-        overlapSamples <= audio.length
+        (END_REASONS as readonly unknown[]).includes(reason)
       );
     }
     default:
