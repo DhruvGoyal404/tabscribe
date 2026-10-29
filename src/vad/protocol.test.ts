@@ -23,6 +23,7 @@ describe('isVadRequest', () => {
     init,
     { ...init, vad: 'energy', inputRate: 44_100 },
     { ...init, tuning: { maxSegmentMs: 10_000, minSilenceMs: 500, partialIntervalMs: 2_000 } },
+    { ...init, tuning: { cutSearchMs: 0, overlapMs: 0 } },
     { type: 'stats', id: 3 },
   ])('accepts %o', (request) => {
     expect(isVadRequest(request)).toBe(true);
@@ -36,6 +37,8 @@ describe('isVadRequest', () => {
     ['a fractional sample rate', { ...init, inputRate: 44_100.5 }],
     ['an untunable setting', { ...init, tuning: { startThreshold: 0.1 } }],
     ['an out-of-range setting', { ...init, tuning: { maxSegmentMs: 60_000 } }],
+    ['a zero that only some settings allow', { ...init, tuning: { maxSegmentMs: 0 } }],
+    ['a cut search under 50 ms but not 0', { ...init, tuning: { cutSearchMs: 10 } }],
     ['a string setting', { ...init, tuning: { overlapMs: '2000' } }],
     ['extra keys', { type: 'stats', id: 2, now: true }],
     ['flush on the control channel (it belongs on the audio port)', { type: 'flush', id: 2 }],

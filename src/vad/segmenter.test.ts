@@ -10,8 +10,8 @@ const options: Partial<SegmenterOptions> = {
   minSilenceMs: 500,
   padMs: 200,
   maxSegmentMs: 10_000,
-  // One frame: cuts at the forced point, since these samples get louder with their position.
-  cutSearchMs: 100,
+  // Cuts at the forced point (no search), since these samples get louder with their position.
+  cutSearchMs: 0,
   overlapMs: 2_000,
   firstPartialMs: 1_000,
   partialIntervalMs: 2_000,
