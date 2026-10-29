@@ -6,8 +6,10 @@
 // whichever state is current. A segment ends after `minSilenceMs` of pause, padded by `padMs` on
 // both sides. Long speech without a pause is cut when it reaches `maxSegmentMs`, after the quietest
 // frame of its last `cutSearchMs` (as Silero's get_speech_timestamps splits at its last silence),
-// so the cut tends to fall between words. The next segment repeats the last `overlapMs` before the
-// cut, so a word the cut splits anyway is heard whole once (the ASR side de-duplicates).
+// so the cut tends to fall between words. The next segment can repeat the last `overlapMs` before
+// the cut, so a word the cut splits is heard whole once (the ASR side de-duplicates). That's off by
+// default: on continuous speech the repeat cost more than it saved, re-decoded differently and
+// dropped or doubled words around the cut (docs/spikes/p3b-streaming.md, piece 4).
 
 export interface SegmenterOptions {
   sampleRate: number;
@@ -23,7 +25,7 @@ export interface SegmenterOptions {
   maxSegmentMs: number;
   /** A forced cut goes after the quietest frame of this last stretch of the segment; 0 cuts at the maximum. */
   cutSearchMs: number;
-  /** Repeated at the start of the segment that follows a forced cut. */
+  /** Repeated at the start of the segment that follows a forced cut; 0 repeats nothing. */
   overlapMs: number;
   /** First partial snapshot of a growing segment, measured from speech start. */
   firstPartialMs: number;
@@ -39,7 +41,7 @@ export const DEFAULT_SEGMENTER: SegmenterOptions = {
   padMs: 200,
   maxSegmentMs: 10_000,
   cutSearchMs: 2_000,
-  overlapMs: 2_000,
+  overlapMs: 0,
   firstPartialMs: 1_000,
   partialIntervalMs: 2_000,
 };
