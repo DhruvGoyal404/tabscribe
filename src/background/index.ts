@@ -15,6 +15,8 @@ import {
   isMessage,
   isReply,
   settle,
+  WEBGPU_FAILURE_KEY,
+  type CaptionRequest,
   type Message,
   type Reply,
 } from '../shared/messages';
@@ -72,8 +74,10 @@ async function ensureOffscreenDocument(): Promise<void> {
   creatingOffscreen ??= chrome.offscreen
     .createDocument({
       url: OFFSCREEN_PATH,
-      reasons: [chrome.offscreen.Reason.USER_MEDIA],
-      justification: 'Plays captured tab audio back to the user and measures its level.',
+      reasons: [chrome.offscreen.Reason.USER_MEDIA, chrome.offscreen.Reason.WORKERS],
+      justification:
+        'Plays captured tab audio back to the user, measures its level, and captions it on the ' +
+        'device in voice-detection and speech-recognition workers.',
     })
     .finally(() => {
       creatingOffscreen = null;
@@ -98,7 +102,11 @@ async function teardown(): Promise<void> {
 
 // --- Capture lifecycle --------------------------------------------------------------------------
 
-async function startCapture(tabId: number, streamId: string): Promise<void> {
+async function startCapture(
+  tabId: number,
+  streamId: string,
+  captions: CaptionRequest,
+): Promise<void> {
   const current = await readState();
   if (current.status === 'capturing' && current.tabId === tabId) return;
   if (current.status !== 'idle' && current.status !== 'error') await stopCapture();
@@ -113,6 +121,8 @@ async function startCapture(tabId: number, streamId: string): Promise<void> {
       type: 'offscreen/start',
       streamId,
       muted: mutedInfo?.muted ?? false,
+      plan: captions.plan,
+      allowDownload: captions.allowDownload,
     });
     await dispatch({ type: 'started' });
   } catch (error) {
@@ -146,9 +156,14 @@ chrome.runtime.onMessage.addListener(
     if (sender.id !== chrome.runtime.id || !isMessage(message)) return false;
     switch (message.type) {
       case 'capture/start':
-        void settle(serialize(() => startCapture(message.tabId, message.streamId))).then(
-          sendResponse,
-        );
+        void settle(
+          serialize(() =>
+            startCapture(message.tabId, message.streamId, {
+              plan: message.plan,
+              allowDownload: message.allowDownload,
+            }),
+          ),
+        ).then(sendResponse);
         return true;
       case 'capture/stop':
         void settle(serialize(stopCapture)).then(sendResponse);
@@ -158,6 +173,10 @@ chrome.runtime.onMessage.addListener(
         return false;
       case 'offscreen/error':
         void serialize(() => fail(message.message));
+        return false;
+      case 'offscreen/webgpu-failed':
+        // The popup plans WASM from now on. Captions stop with an error; capture goes on.
+        void chrome.storage.local.set({ [WEBGPU_FAILURE_KEY]: message.message });
         return false;
       default:
         // offscreen/start, offscreen/set-muted and offscreen/stop are for the offscreen document.
@@ -187,4 +206,6 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
 
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   console.info(`[tabscribe] service worker ready (${reason})`);
+  // A new version may have fixed what made WebGPU fail: plan it again.
+  if (reason === 'update') void chrome.storage.local.remove(WEBGPU_FAILURE_KEY);
 });

@@ -22,6 +22,17 @@ test('popup renders the idle state', async ({ context, extensionId }) => {
   await expect(page.getByText(/^v\d+\.\d+\.\d+$/)).toBeVisible();
 });
 
+// Nothing downloads without an explicit action: with the speech model not cached (as in a fresh
+// profile), the popup names the download on the Start button and says what it is.
+test('popup asks before downloading the speech model', async ({ context, extensionId }) => {
+  const page = await context.newPage();
+  await page.goto(`chrome-extension://${extensionId}/src/popup/index.html`);
+
+  await expect(page.getByText(/^Captions: whisper-base (fp16\/fp16 on WebGPU|q8\/q8 on WASM)/)).toBeVisible();
+  await expect(page.getByRole('button', { name: /^Download \d+\.\d MB and start$/ })).toBeEnabled();
+  await expect(page.getByText(/one-time \d+\.\d MB download of the whisper-base speech model/)).toBeVisible();
+}); // prettier-ignore
+
 // ONNX Runtime needs SharedArrayBuffer for multithreaded WASM. The manifest's COOP/COEP keys make
 // every extension page cross-origin isolated; its workers inherit that (checked in the bench).
 for (const page of ['popup', 'options']) {
