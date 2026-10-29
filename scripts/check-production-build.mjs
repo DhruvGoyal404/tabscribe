@@ -2,7 +2,8 @@
 // Checks the production build in dist/ after `npm run build`:
 // - the manifest keeps exactly the approved permissions, no host permissions, the approved CSP and
 //   cross-origin isolation;
-// - nothing from the dev-only bench (page, fixtures, ONNX Runtime, model files) leaked in.
+// - nothing from the dev-only bench (page, fixtures) leaked in, and no Whisper weights;
+// - the caption workers, ONNX Runtime and the Silero VAD model are there.
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,15 +18,19 @@ const ISOLATION = {
   cross_origin_embedder_policy: 'require-corp',
   cross_origin_opener_policy: 'same-origin',
 };
-// Until P3b wires ASR into the offscreen document, its workers and models are bench-only.
+// The bench (page, fixtures) stays out. The caption workers, ONNX Runtime and the bundled Silero
+// VAD ship; Whisper's weights never do: they're downloaded on demand, after the user agrees.
 const FORBIDDEN = [
   /(^|\/)bench(\/|\.|-)/,
   /\.flac$/,
-  /\.onnx$/,
-  /ort-wasm/,
-  /asr\.worker/,
-  /vad\.worker/,
-  /silero/,
+  /^(?!assets\/silero_vad_16k_op15-[\w-]+\.onnx$).*\.onnx$/,
+];
+// What captions need in the build.
+const REQUIRED = [
+  /^assets\/asr\.worker-/,
+  /^assets\/vad\.worker-/,
+  /^assets\/ort-wasm-/,
+  /^assets\/silero_vad_16k_op15-/,
 ];
 
 const problems = [];
@@ -61,10 +66,14 @@ for (const file of files) {
   }
 }
 
+for (const pattern of REQUIRED) {
+  if (!files.some((file) => pattern.test(file))) problems.push(`missing from dist/: ${pattern}`);
+}
+
 if (problems.length > 0) {
   for (const problem of problems) console.error(`✗ ${problem}`);
   process.exit(1);
 }
 console.log(
-  `✓ dist/ (${String(files.length)} files): approved permissions, CSP and isolation, no dev-only files.`,
+  `✓ dist/ (${String(files.length)} files): approved permissions, CSP and isolation, caption runtime, no dev-only files.`,
 );

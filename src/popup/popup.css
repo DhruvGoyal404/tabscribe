@@ -41,6 +41,37 @@ meter {
   font: inherit;
 }
 
+.captions {
+  margin-top: 12px;
+}
+
+.caption-status,
+.plan,
+.consent {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.caption {
+  margin-top: 6px;
+  max-height: 8lh;
+  overflow-y: auto;
+  word-break: break-word;
+}
+
+.caption .partial {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.plan {
+  margin-top: 12px;
+}
+
+.consent {
+  margin-top: 6px;
+}
+
 .error {
   margin-top: 12px;
   color: #d1242f;

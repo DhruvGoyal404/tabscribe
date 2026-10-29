@@ -1,7 +1,7 @@
 // VAD worker: native-rate capture audio in, speech segments out. It runs apart from the ASR worker
 // because a Whisper call blocks its thread for seconds on WASM, and voice detection mustn't stall
-// behind it. Audio arrives on one MessagePort (from the capture worklet) and segments leave on
-// another (to the ASR worker), so neither passes through a page's main thread.
+// behind it. Audio arrives on one MessagePort, straight from the capture worklet, and segments
+// leave on another, to the caption scheduler in the offscreen document.
 //
 // Silero VAD runs on ONNX Runtime's WASM backend, from the same bundled runtime binary as the ASR
 // worker and a model file bundled with the extension. If it can't load, frame energy is used.
@@ -22,7 +22,7 @@ import {
 import { DEFAULT_SEGMENTER, Segmenter, type SegmentEvent } from './segmenter';
 
 ort.env.wasm.wasmPaths = { wasm: new URL(ortWasmUrl, self.location.href).href };
-// Not cross-origin isolated, so ORT would fall back to one thread anyway; say so explicitly.
+// Silero needs well under a millisecond per frame on one thread; leave the other cores to Whisper.
 ort.env.wasm.numThreads = 1;
 
 /** Silero's frame at 16 kHz: 512 new samples (32 ms), with 64 samples of context before them. */
