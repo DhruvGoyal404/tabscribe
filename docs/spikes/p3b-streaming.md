@@ -8,23 +8,24 @@ fallback WASM q8/q8). Built in PR-sized pieces. This doc grows with each piece.
 | 1     | Per-call cost measurement (encoder vs decoder) and the VAD worker                          | PR #9    |
 | 1b    | Cross-origin isolation for multithreaded WASM, bench thread selector                       | PR #11   |
 | 1c    | Chrome stable results, the q8 step-count check, features for the real audio only           | PR #12   |
-| 2     | ASR side: segment queue, repetition and no-speech guards, interruptible partials, ordering | **this** |
-| 3     | Wiring: worklet → VAD → ASR in the offscreen document, runtime backend choice, consent     |          |
+| 2     | ASR side: segment queue, repetition and no-speech guards, interruptible partials, ordering | PR #13   |
+| 3     | Wiring: worklet → VAD → ASR in the offscreen document, runtime backend choice, consent     | **this** |
 | 4     | Popup debug transcript, live bench mode (latency p50/p95), regression fixture, memory      |          |
 
 ## Pipeline
 
 ```text
 offscreen document
-  AudioWorklet (native rate, mono) ──MessagePort──▶ VAD worker ──MessagePort──▶ ASR worker
-                                                   resampler → 16 kHz            segment queue
-                                                   Silero VAD (32 ms frames)     guards, Whisper
-                                                   segmenter (pauses, max cut)   ordered results
+  capture tap (audio thread) ──port──▶ VAD worker ──port──▶ page: CaptionScheduler ──▶ ASR worker
+  native rate, mono, 2048-sample     resampler → 16 kHz      order, partials,          guards,
+  chunks                             Silero VAD (32 ms)      WASM merging, de-dup      Whisper
+                                     segmenter (pauses, cut)
 ```
 
 - **Three threads, so VAD never waits on Whisper.** A WASM Whisper call blocks its thread for
-  seconds. Audio and segments travel over `MessagePort`s with transferred buffers, so nothing
-  passes through the offscreen page's main thread.
+  seconds. Audio goes from the audio thread to the VAD worker over a `MessagePort` with transferred
+  buffers. Segments pass through the offscreen page, which runs the scheduler and does little
+  else, so it answers within a decoder step.
 - **End-of-stream travels on the data path.** Messages on different channels aren't ordered
   relative to each other, so `flush` follows the last audio chunk on the audio port, and `flushed`
   follows the last segment on the segments port.
@@ -395,6 +396,63 @@ Remaining errors at the cuts, for the tuning piece:
   "Rosebeath").
 - Partials aren't de-duplicated, so a partial after a forced cut can briefly show the repeated
   words until its final replaces it.
+
+## Piece 3: captions in the extension
+
+### Backend choice and consent
+
+The popup plans before Start (`planBackend` in [backend.ts](../../src/asr/backend.ts)): whisper-base
+on **WebGPU fp16** when the adapter is a hardware one with shader-f16, otherwise **WASM q8** on 4
+threads (half the cores, at most 4). It shows the plan and its reason, for example "Captions:
+whisper-base fp16/fp16 on WebGPU. WebGPU (intel gen-12lp)." or "… on WASM, 4 threads. WebGPU
+unavailable: requestAdapter() returned null."
+
+**Nothing downloads without an explicit action.** If the planned files aren't all cached, the
+popup says what the download is (size, from huggingface.co, stays on the device) and the button
+reads **Download 148.8 MB and start** (79.7 MB on WASM). Only that click sends `allowDownload`.
+The ASR worker enforces it: every request Transformers.js makes goes through its `env.fetch`,
+which refuses to touch the network otherwise.
+
+If WebGPU fails to load, the failure is kept in `storage.local` and the next plan is WASM, with
+that reason. An extension update clears it.
+
+### Pinned probes (a Transformers.js 4.3.1 gap)
+
+The download guard caught a request the bench never showed: with every pinned file cached,
+Transformers.js still asked for `…/resolve/main/tokenizer_config.json`. Its existence and size
+probes (`get_pipeline_files`, the pipeline's progress totals, `get_tokenizer_files`) leave out the
+revision, so they name `main`, a moving branch, on every load. The weights themselves always
+loaded at the pinned revision. The worker's `env.fetch` now rewrites `/resolve/main/` to the
+pinned revision for catalogue models and answers from the cache first, so **a cached start makes
+no network request**. Worth an upstream issue next to the encoder one.
+
+### Lifecycle
+
+- Start brings capture and playback up first; captions follow on their own. The model loads
+  (with download progress in the popup), then the capture tap connects to the VAD, so a long
+  download doesn't pile up segments.
+- A caption failure (load, decode) shows "Captions stopped: …" and leaves capture and playback
+  running.
+- The popup gets caption status and captions over the session port, with a catch-up snapshot when
+  it reopens mid-capture. It shows the newest final and the current partial; piece 4 adds the
+  transcript.
+- **Stop terminates both workers**, which frees the model. The next Start loads it from cache.
+
+### End-to-end check (Chromium, this machine)
+
+[p3b-captions-probe.mjs](./p3b-captions-probe.mjs) plays the English fixture in a tab, runs the
+extension's action on it (as the P2 probe does), clicks Start and records what the popup shows.
+
+| Run                       | Popup before Start                     | Ready after | Finals | Partial updates | After Stop         |
+| ------------------------- | -------------------------------------- | ----------: | -----: | --------------: | ------------------ |
+| WebGPU, fresh profile     | consent, "Download 148.8 MB and start" |      55.3 s |  7 / 7 |              16 | no offscreen, idle |
+| WebGPU, cached            | no consent, "Start"                    |       9.8 s |  7 / 7 |              16 | no offscreen, idle |
+| WASM (forced), not cached | consent, "Download 79.7 MB and start"  |      27.6 s |  7 / 7 |               0 | no offscreen, idle |
+
+"Ready after" runs from the click to "Listening for speech": download (first runs), session
+creation and the warm-up decode. All seven sentences of the fixture were captioned in every run,
+as the VAD's seven natural segments. Caption latency isn't measured here: piece 4's live bench
+mode does p50/p95.
 
 ## How to re-measure on Chrome stable
 
