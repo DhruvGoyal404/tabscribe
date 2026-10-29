@@ -31,6 +31,7 @@ import {
   PROFILE_SECONDS,
   secondsToSamples,
   median,
+  percentile,
   segmentOffsets,
   summarise,
   type CallTiming,
@@ -40,7 +41,9 @@ import { FIXTURES, type Fixture } from './fixtures';
 import { characterErrorRate, normalizeText, wordErrorRate } from './metrics';
 import type { SegmenterTuning } from '../vad/protocol';
 import { decodeStream, type StreamRun } from './stream';
+import { runLive, type LiveAsr } from './live';
 import { runVad, type VadRun } from './vad-run';
+import { CAPTION_PROMPTING } from '../asr/backend';
 
 /** Fixtures are decoded at a typical tab-capture rate and resampled like live audio will be. */
 const CAPTURE_RATE = 48_000;
@@ -48,6 +51,7 @@ const RESULTS_KEY = 'tabscribe-bench-results';
 const COSTS_KEY = 'tabscribe-bench-costs';
 /** v2: rows name a variant instead of a maximum segment. */
 const STREAM_KEY = 'tabscribe-bench-stream-v2';
+const LIVE_RESULTS = 'tabscribe-bench-live-v2';
 
 interface BenchRow {
   model: ModelKey;
@@ -105,6 +109,11 @@ const ui = {
   clearStream: element('clear-stream', HTMLButtonElement),
   streamResults: element('stream-results', HTMLElement),
   streamTexts: element('stream-texts', HTMLElement),
+  liveFixture: element('live-fixture', HTMLSelectElement),
+  runLive: element('run-live', HTMLButtonElement),
+  clearLive: element('clear-live', HTMLButtonElement),
+  liveResults: element('live-results', HTMLElement),
+  liveTexts: element('live-texts', HTMLElement),
 };
 
 // --- Worker client ------------------------------------------------------------------------------
@@ -198,6 +207,7 @@ function setBusy(busy: boolean, loaded = currentModel !== null): void {
   ui.clearCache.disabled = busy;
   ui.runVad.disabled = busy;
   ui.runStream.disabled = busy || !loaded;
+  ui.runLive.disabled = busy || !loaded;
   for (const select of [ui.model, ui.device, ui.encoder, ui.decoder, ui.threads]) {
     select.disabled = busy;
   }
@@ -636,6 +646,156 @@ async function runStream(): Promise<void> {
   }
 }
 
+// --- Live captions ------------------------------------------------------------------------------
+
+interface LiveRow {
+  config: string;
+  fixture: Fixture['key'];
+  /** Finals the VAD cut; `finals` has a delay for each one shown. */
+  segments: number;
+  finals: number[];
+  partials: number[];
+  wer: number | null;
+  wordsShown: number | null;
+  /** Page and workers, JS and WASM heaps, after the run: GPU buffers aren't counted. */
+  memoryBytes: number | null;
+  ms: number;
+  transcript: string;
+}
+
+const liveRows = loadStored<LiveRow>(LIVE_RESULTS);
+
+/** The bench worker behind the scheduler's port: job ids map to request ids for interrupts. */
+function liveAsr(): LiveAsr {
+  const requests = new Map<number, number>();
+  return {
+    decode: (job) => {
+      const copy = job.audio.slice();
+      return send(
+        'decoded',
+        (id) => {
+          requests.set(job.id, id);
+          return { type: 'decode', id, audio: copy, kind: job.kind, prompt: job.prompt };
+        },
+        [copy.buffer],
+      );
+    },
+    interrupt: (jobId) => {
+      const id = requests.get(jobId);
+      if (id !== undefined) worker.postMessage({ type: 'interrupt', id } satisfies WorkerRequest);
+    },
+  };
+}
+
+type MeasureMemory = () => Promise<{ bytes: number }>;
+
+/** Chrome's measureUserAgentSpecificMemory: needs cross-origin isolation, as this page has. */
+async function measureMemory(): Promise<number | null> {
+  const measure = (performance as { measureUserAgentSpecificMemory?: MeasureMemory })
+    .measureUserAgentSpecificMemory;
+  if (!self.crossOriginIsolated || !measure) return null;
+  try {
+    return (await measure.call(performance)).bytes;
+  } catch {
+    return null;
+  }
+}
+
+const ms = (value: number): string => (Number.isFinite(value) ? (value / 1000).toFixed(2) : '—');
+
+function liveCells(row: LiveRow): string[] {
+  return [
+    row.config,
+    row.fixture,
+    String(row.segments),
+    String(row.finals.length),
+    ms(percentile(row.finals, 50)),
+    ms(percentile(row.finals, 95)),
+    ms(percentile(row.finals, 100)),
+    String(row.partials.length),
+    ms(percentile(row.partials, 50)),
+    ms(percentile(row.partials, 95)),
+    row.wer === null ? '—' : pct(row.wer),
+    row.wordsShown === null ? '—' : String(row.wordsShown),
+    row.memoryBytes === null ? '—' : mb(row.memoryBytes),
+    (row.ms / 1000).toFixed(1),
+  ];
+}
+
+const liveLabel = (row: LiveRow): string => `${row.config}, ${row.fixture}`;
+
+function renderLive(): void {
+  ui.liveResults.replaceChildren(
+    ...liveRows.map((row) => {
+      const tr = document.createElement('tr');
+      for (const text of liveCells(row)) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.append(td);
+      }
+      return tr;
+    }),
+  );
+  ui.liveTexts.replaceChildren(
+    ...liveRows.map((row) => {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = `Live captions: ${liveLabel(row)}`;
+      const text = document.createElement('p');
+      text.textContent = row.transcript || '(none shown)';
+      details.append(summary, text);
+      return details;
+    }),
+  );
+}
+
+/** One fixture in real time, with the extension's scheduler options for the loaded device. */
+async function runLiveCaptions(): Promise<void> {
+  const loaded = currentModel;
+  const entry = FIXTURES.find((candidate) => candidate.key === ui.liveFixture.value);
+  if (!loaded || !entry) return;
+  showError('');
+  setBusy(true);
+  try {
+    const config = configLabel(loaded.model, loaded.device, loaded.dtype, loaded.threads);
+    const capture = await fixtureCapture(entry);
+    const seconds = (capture.length / CAPTURE_RATE).toFixed(0);
+    ui.progress.textContent = `Live: playing ${entry.key} in real time (${seconds} s)…`;
+    const run = await runLive(
+      capture,
+      CAPTURE_RATE,
+      {
+        partials: loaded.device === 'webgpu',
+        mergeQueued: loaded.device === 'wasm',
+        prompting: CAPTION_PROMPTING,
+      },
+      liveAsr(),
+    );
+    const english = entry.language === 'en';
+    const shown = normalizeText(run.transcript, 'en').split(' ').filter(Boolean).length;
+    liveRows.push({
+      config,
+      fixture: entry.key,
+      segments: run.log.segments,
+      finals: run.log.finalMs,
+      partials: run.log.partialMs,
+      wer: english ? wordErrorRate(entry.reference, run.transcript, 'en').rate : null,
+      wordsShown: english ? null : shown,
+      memoryBytes: await measureMemory(),
+      ms: run.ms,
+      transcript: run.transcript,
+    });
+    store(LIVE_RESULTS, liveRows);
+    renderLive();
+    ui.progress.textContent = `Live done: ${config}, ${entry.key} (VAD: ${run.vad}).`;
+  } catch (error) {
+    showError(String(error));
+    ui.progress.textContent = '';
+  } finally {
+    setBusy(false);
+  }
+}
+
 function markdown(): string {
   const header = [
     'Model', 'Device', 'Enc / Dec', 'Load', 'Load (s)', 'EN RTF 1st', 'EN RTF 2nd', 'EN WER',
@@ -701,6 +861,28 @@ function markdown(): string {
     ...streamRows.map((row) => line(streamCells(row))),
     '',
     ...streamRows.map((row) => `- ${streamLabel(row)}: ${row.transcript}`),
+    '',
+    '### Live captions',
+    line([
+      'Config',
+      'Fixture',
+      'Segments',
+      'Finals shown',
+      'Final p50 (s)',
+      'Final p95 (s)',
+      'Final max (s)',
+      'Partials',
+      'Partial p50 (s)',
+      'Partial p95 (s)',
+      'WER',
+      'Words shown',
+      'Memory',
+      'Run (s)',
+    ]),
+    line(Array.from({ length: 14 }, () => '---')),
+    ...liveRows.map((row) => line(liveCells(row))),
+    '',
+    ...liveRows.map((row) => `- ${liveLabel(row)}: ${row.transcript}`),
     '',
     '### Outputs',
     ...rows.flatMap((row) => [
@@ -928,6 +1110,11 @@ fillSelect(ui.encoder, DTYPES, 'fp32');
 fillSelect(ui.decoder, DTYPES, 'q4');
 fillSelect(ui.vadKind, ['silero', 'energy'], 'silero');
 fillSelect(
+  ui.liveFixture,
+  FIXTURES.map((entry) => entry.key),
+  'en-vp',
+);
+fillSelect(
   ui.threads,
   [
     'auto',
@@ -963,6 +1150,12 @@ ui.clearStream.addEventListener('click', () => {
   store(STREAM_KEY, streamRows);
   renderStream();
 });
+ui.runLive.addEventListener('click', () => void runLiveCaptions());
+ui.clearLive.addEventListener('click', () => {
+  liveRows.length = 0;
+  store(LIVE_RESULTS, liveRows);
+  renderLive();
+});
 ui.clearCosts.addEventListener('click', () => {
   costs.length = 0;
   store(COSTS_KEY, costs);
@@ -978,6 +1171,7 @@ renderEnvironment();
 renderRows();
 renderCosts();
 renderStream();
+renderLive();
 setBusy(false);
 void updateSize();
 void send('gpu-info', (id) => ({ type: 'gpu-info', id })).then(
