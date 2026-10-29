@@ -20,12 +20,14 @@ const loading: CaptionStatus = {
   downloading: true,
   loadedBytes: 40e6,
   totalBytes: 79.7e6,
+  bytesPerSecond: null,
 };
 
 describe('isCaptionStatus', () => {
   it.each<CaptionStatus>([
     loading,
-    { state: 'loading', plan, downloading: false, loadedBytes: 0, totalBytes: 0 },
+    { ...loading, downloading: false, loadedBytes: 0, totalBytes: 0 },
+    { ...loading, bytesPerSecond: 0.6e6 },
     { state: 'listening', plan, vad: 'silero' },
     { state: 'listening', plan, vad: 'energy' },
     { state: 'error', plan, message: 'ModelNotDownloaded' },
@@ -38,7 +40,15 @@ describe('isCaptionStatus', () => {
     ['an unknown state', { state: 'off', plan }],
     ['a bad plan', { state: 'listening', plan: { ...plan, threads: 0 }, vad: 'silero' }],
     ['negative bytes', { ...loading, loadedBytes: -1 }],
-    ['a missing download flag', { state: 'loading', plan, loadedBytes: 0, totalBytes: 0 }],
+    [
+      'a missing rate',
+      { state: 'loading', plan, downloading: true, loadedBytes: 0, totalBytes: 0 },
+    ],
+    ['a bad rate', { ...loading, bytesPerSecond: Number.NaN }],
+    [
+      'a missing download flag',
+      { state: 'loading', plan, loadedBytes: 0, totalBytes: 0, bytesPerSecond: null },
+    ],
     ['an unknown VAD', { state: 'listening', plan, vad: 'webrtc' }],
     ['an empty error', { state: 'error', plan, message: '' }],
     ['extra keys', { state: 'listening', plan, vad: 'silero', extra: 1 }],
@@ -68,6 +78,9 @@ describe('describeStatus', () => {
   it('says what is happening', () => {
     expect(describeStatus(loading)).toBe('Downloading the speech model: 40.0 of 79.7 MB');
     expect(describeStatus({ ...loading, downloading: false })).toBe('Loading the speech model…');
+    expect(describeStatus({ ...loading, bytesPerSecond: 0.6e6 })).toBe('Downloading the speech model: 40.0 of 79.7 MB, 0.6 MB/s, about 65 s left');
+    expect(describeStatus({ ...loading, loadedBytes: 70e6, bytesPerSecond: 0.6e6 })).toBe('Downloading the speech model: 70.0 of 79.7 MB, 0.6 MB/s, about 15 s left');
+    expect(describeStatus({ ...loading, loadedBytes: 0, totalBytes: 148.8e6, bytesPerSecond: 0.6e6 })).toBe('Downloading the speech model: 0.0 of 148.8 MB, 0.6 MB/s, about 4 min left');
     expect(describeStatus({ state: 'listening', plan, vad: 'silero' })).toBe('Listening for speech');
     expect(describeStatus({ state: 'error', plan, message: 'out of memory' })).toBe('Captions stopped: out of memory');
   }); // prettier-ignore

@@ -9,6 +9,8 @@ export type CaptionStatus =
       downloading: boolean;
       loadedBytes: number;
       totalBytes: number;
+      /** Recent download speed; null until known. */
+      bytesPerSecond: number | null;
     }
   /** The model is loaded and audio flows to the VAD. */
   | { state: 'listening'; plan: CaptionPlan; vad: 'silero' | 'energy' }
@@ -49,10 +51,18 @@ export function isCaptionStatus(value: unknown): value is CaptionStatus {
   switch (value.state) {
     case 'loading':
       return (
-        hasExactKeys(value, ['state', 'plan', 'downloading', 'loadedBytes', 'totalBytes']) &&
+        hasExactKeys(value, [
+          'state',
+          'plan',
+          'downloading',
+          'loadedBytes',
+          'totalBytes',
+          'bytesPerSecond',
+        ]) &&
         typeof value.downloading === 'boolean' &&
         isCount(value.loadedBytes) &&
-        isCount(value.totalBytes)
+        isCount(value.totalBytes) &&
+        (value.bytesPerSecond === null || isCount(value.bytesPerSecond))
       );
     case 'listening':
       return (
@@ -92,13 +102,23 @@ export function isCaptionMessage(value: unknown): value is CaptionMessage {
   }
 }
 
+/** A rough ETA: whole minutes, or 5 s steps under a minute and a half. */
+function timeLeft(seconds: number): string {
+  if (seconds < 90) return `about ${String(Math.max(5, Math.round(seconds / 5) * 5))} s left`;
+  return `about ${String(Math.round(seconds / 60))} min left`;
+}
+
 /** One line for the popup. */
 export function describeStatus(status: CaptionStatus): string {
   switch (status.state) {
     case 'loading': {
       if (!status.downloading || status.totalBytes === 0) return 'Loading the speech model…';
       const mb = (bytes: number) => (bytes / 1e6).toFixed(1);
-      return `Downloading the speech model: ${mb(status.loadedBytes)} of ${mb(status.totalBytes)} MB`;
+      const progress = `Downloading the speech model: ${mb(status.loadedBytes)} of ${mb(status.totalBytes)} MB`;
+      const rate = status.bytesPerSecond;
+      if (!rate) return progress;
+      const left = timeLeft(Math.max(0, status.totalBytes - status.loadedBytes) / rate);
+      return `${progress}, ${mb(rate)} MB/s, ${left}`;
     }
     case 'listening':
       return 'Listening for speech';
