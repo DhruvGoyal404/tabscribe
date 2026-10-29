@@ -23,6 +23,8 @@ export interface StreamStats {
   outcomes: Partial<Record<DecodeOutcome, number>>;
   /** Sum of the worker's per-segment time. */
   decodeMs: number;
+  /** P(English) of each segment, from the language step: what the English threshold judges. */
+  englishProbs: number[];
 }
 
 export interface StreamRun {
@@ -47,6 +49,7 @@ export function decodeStream(
       retries: 0,
       outcomes: {},
       decodeMs: 0,
+      englishProbs: [],
     };
     const finish = () => {
       const transcript = captions
@@ -75,6 +78,7 @@ export function decodeStream(
         stats.retries += Math.max(0, result.attempts.length - 1);
         if (caption.text && hasLoop(caption.text)) stats.loopsShown += 1;
         stats.decodeMs += result.ms;
+        stats.englishProbs.push(result.englishProb);
         if (captions.length === finals.length) finish();
       },
     );

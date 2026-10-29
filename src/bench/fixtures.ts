@@ -1,12 +1,16 @@
 // Bench fixtures; licences and sources are in fixtures/README.md.
 import enUrl from './fixtures/en-librispeech.flac?url';
+import enVoxpopuliUrl from './fixtures/en-voxpopuli.flac?url';
+import frDeUrl from './fixtures/fr-de-fleurs.flac?url';
 import hiUrl from './fixtures/hi-fleurs.flac?url';
+import nonspeechUrl from './fixtures/nonspeech-musan.flac?url';
 
 export interface Fixture {
-  key: 'en' | 'hi';
+  key: 'en' | 'hi' | 'en-vp' | 'fr-de' | 'nonspeech';
   url: string;
-  language: 'en' | 'hi';
-  /** What was said, as published with the dataset. */
+  /** What is spoken. Captions should show only English; anything else should show nothing. */
+  language: 'en' | 'hi' | 'fr+de' | 'none';
+  /** What was said, as published with the dataset (empty for no speech). */
   reference: string;
   /** Reference English translation (FLoRes), for judging translate output by hand. */
   translationReference?: string;
@@ -44,5 +48,40 @@ export const FIXTURES: readonly Fixture[] = [
       'Pronunciation is relatively easy in Italian since most words are pronounced exactly how they are written',
       'In the churchyard, there are interesting marble sculptures of doves over some tombs.',
     ].join(' '),
+  },
+  {
+    // Continuous parliamentary speech by four speakers (two of them women), most of them not
+    // native English speakers: long runs without a pause, so the segmenter makes real forced cuts.
+    key: 'en-vp',
+    url: enVoxpopuliUrl,
+    language: 'en',
+    reference: [
+      'It is the corrupt elites who are depriving the people of Angola of their basic human rights access to healthcare, food and education by stealing public money intended for basic social services. We are seriously concerned about the possible mismanagement of EU development funds by the local authorities, and in this regard we are asking the Commission to review the national indicative programme under the 11th EDF and to ensure that good governance, respect for human rights and the fight against corruption are the main financing priorities for this fabulously rich country, which suffers also from a fabulously corrupt elite.',
+      'But even worse than those billions is the frustration and anger when a tourist, an artist and we love them, we proved this today a company proprietor or a worker, a student, a patient or a doctor cannot find that necessary information, such as a form to fill out when he or she encounters problems when delivering documents online. This portal will help to solve those problems. I find it especially important today, when some politicians call Europe an imaginary community,',
+      "As Members of the European Parliament the only directly elected EU institution we have a crucial role to play in promoting the aims of the European Year of Citizens 2013 by bridging the gap between Brussels and Member States, communicating the rights and benefits of EU citizenship, endorsing citizens' concerns in formulating EU policies and promoting participative democracy.",
+      'This resolution tackles the call on the fight against Boko Haram and its terrorism, but also addresses the Nigerian authorities, calling for reform of the security forces, to make sure that they prevent extrajudicial executions, arbitrary detentions and torture, and reform of the criminal judicial system to make sure that the law is enforced to fight violence, terrorism and corruption, which is massive in Nigeria.',
+    ].join(' '),
+  },
+  {
+    // Not English: three French then three German sentences. Captions should stay empty.
+    key: 'fr-de',
+    url: frDeUrl,
+    language: 'fr+de',
+    reference: [
+      "Auparavant, le PDG de Ring, Jamie Siminoff, a fait remarquer qu'il a lancé l'entreprise lorsque la sonnette de sa porte d'entrée n'était pas audible depuis son magasin dans son garage.",
+      "Le patient s'était rendu au Nigeria, où certains cas de virus Ebola se sont produits.",
+      'Le ski est une activité de voyage majeure qui compte de nombreux aficionados, parfois appelés « ski bums », qui organisent leurs vacances entières en fonction du ski dans des endroits spécifiques.',
+      'Die Wissenschaft weist nun darauf hin, dass diese massive Kohlenstoffwirtschaft die Biosphäre aus einem ihrer stabilen Zustände, der die menschliche Evolution in den letzten zwei Millionen Jahren getragen hat, herausgebracht hat.',
+      'Der Amazonas ist auch der breiteste Fluss der Erde, teilweise bis zu sechs Meilen breit.',
+      'Die lokalen Behörden ermahnen die Einwohner in der Nähe der Anlage dazu, sich innerhalb von Gebäuden aufzuhaltem, Klimaanlagen auszuschalten und kein Leitungswasser zu trinken.',
+    ].join(' '),
+  },
+  {
+    // No speech: instrumental music, then digital silence, then background noise. Captions should
+    // stay empty; this is where Whisper hallucinates ("Thank you.") and loops.
+    key: 'nonspeech',
+    url: nonspeechUrl,
+    language: 'none',
+    reference: '',
   },
 ];

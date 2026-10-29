@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { median, segmentOffsets, summarise } from './cost';
+import { median, percentile, segmentOffsets, summarise } from './cost';
 
 describe('median', () => {
   it('handles odd, even and empty input without mutating it', () => {
@@ -8,6 +8,17 @@ describe('median', () => {
     expect(values).toEqual([5, 1, 3]);
     expect(median([4, 1, 3, 2])).toBe(2.5);
     expect(median([])).toBeNaN();
+  });
+});
+
+describe('percentile', () => {
+  it('picks the nearest-rank value', () => {
+    const values = Array.from({ length: 20 }, (_, i) => 20 - i); // 20 down to 1
+    expect(percentile(values, 50)).toBe(10);
+    expect(percentile(values, 95)).toBe(19);
+    expect(percentile(values, 100)).toBe(20);
+    expect(percentile([7], 95)).toBe(7);
+    expect(percentile([], 50)).toBeNaN();
   });
 });
 

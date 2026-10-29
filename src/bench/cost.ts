@@ -42,6 +42,14 @@ export function median(values: readonly number[]): number {
     : ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
 }
 
+/** The nearest-rank percentile (`p` from 0 to 100): a value that occurred, not an interpolation. */
+export function percentile(values: readonly number[], p: number): number {
+  if (values.length === 0) return NaN;
+  const sorted = [...values].sort((a, b) => a - b);
+  const rank = Math.max(1, Math.ceil((p / 100) * sorted.length));
+  return sorted[rank - 1] ?? NaN;
+}
+
 /** Start samples of `count` segments spread evenly from the start to the end of the clip. */
 export function segmentOffsets(
   totalSamples: number,

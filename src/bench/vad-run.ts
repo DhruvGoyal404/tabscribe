@@ -10,7 +10,7 @@ import {
 import type { SegmentEvent } from '../vad/segmenter';
 
 /** What a 128-frame worklet would post after batching 16 render quanta (about 43 ms at 48 kHz). */
-const CHUNK = 2048;
+export const CHUNK = 2048;
 
 export interface VadRun {
   vad: VadKind;

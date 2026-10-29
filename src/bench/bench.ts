@@ -30,14 +30,15 @@ import {
   PROFILE_OFFSETS,
   PROFILE_SECONDS,
   secondsToSamples,
+  median,
   segmentOffsets,
   summarise,
   type CallTiming,
   type CostRow,
 } from './cost';
 import { FIXTURES, type Fixture } from './fixtures';
-import { characterErrorRate, wordErrorRate } from './metrics';
-import { DEFAULT_SEGMENTER } from '../vad/segmenter';
+import { characterErrorRate, normalizeText, wordErrorRate } from './metrics';
+import type { SegmenterTuning } from '../vad/protocol';
 import { decodeStream, type StreamRun } from './stream';
 import { runVad, type VadRun } from './vad-run';
 
@@ -45,7 +46,8 @@ import { runVad, type VadRun } from './vad-run';
 const CAPTURE_RATE = 48_000;
 const RESULTS_KEY = 'tabscribe-bench-results';
 const COSTS_KEY = 'tabscribe-bench-costs';
-const STREAM_KEY = 'tabscribe-bench-stream';
+/** v2: rows name a variant instead of a maximum segment. */
+const STREAM_KEY = 'tabscribe-bench-stream-v2';
 
 interface BenchRow {
   model: ModelKey;
@@ -99,7 +101,6 @@ const ui = {
   vadMax: element('vad-max', HTMLInputElement),
   runVad: element('run-vad', HTMLButtonElement),
   vadResults: element('vad-results', HTMLElement),
-  streamMax: element('stream-max', HTMLInputElement),
   runStream: element('run-stream', HTMLButtonElement),
   clearStream: element('clear-stream', HTMLButtonElement),
   streamResults: element('stream-results', HTMLElement),
@@ -504,13 +505,22 @@ async function runVadOnFixtures(): Promise<void> {
 
 // --- Streaming captions -------------------------------------------------------------------------
 
+/** What the streaming run compares; only the default runs on fixtures that aren't English. */
+const STREAM_VARIANTS: readonly { name: string; tuning: SegmenterTuning; prompting: boolean }[] = [
+  { name: 'default', tuning: {}, prompting: false },
+  { name: 'prompt on', tuning: {}, prompting: true },
+  { name: 'hard cut', tuning: { cutSearchMs: 0 }, prompting: false },
+  { name: 'no overlap', tuning: { overlapMs: 0 }, prompting: false },
+];
+
 interface StreamRow {
   config: string;
   fixture: Fixture['key'];
-  maxSegmentMs: number;
-  prompting: boolean;
-  /** Of the joined captions; null where captions don't apply (Hindi: English only). */
+  variant: string;
+  /** Of the joined captions, for English; null where nothing should be shown. */
   wer: number | null;
+  /** Words shown where nothing should be (not English, or no speech); null for English. */
+  wordsShown: number | null;
   stats: StreamRun['stats'];
   transcript: string;
 }
@@ -524,17 +534,26 @@ function decodeSegment(audio: Float32Array, prompt: DecodePrompt | null) {
   ]);
 }
 
+/** Lowest, median and highest of a run's P(English). */
+function englishRange(probs: readonly number[]): string {
+  if (probs.length === 0) return '—';
+  const sorted = [...probs].sort((a, b) => a - b);
+  const at = (value: number | undefined) => (value ?? NaN).toFixed(2);
+  return `${at(sorted[0])} / ${at(median(sorted))} / ${at(sorted.at(-1))}`;
+}
+
 function streamCells(row: StreamRow): string[] {
   const { stats } = row;
   return [
     row.config,
     row.fixture,
-    `${String(row.maxSegmentMs / 1000)} s`,
-    row.prompting ? 'on' : 'off',
+    row.variant,
     String(stats.segments),
     String(stats.forcedCuts),
     String(stats.prompted),
     row.wer === null ? '—' : pct(row.wer),
+    row.wordsShown === null ? '—' : String(row.wordsShown),
+    englishRange(stats.englishProbs),
     String(stats.loopsCaught),
     String(stats.loopsShown),
     String(stats.retries),
@@ -545,8 +564,7 @@ function streamCells(row: StreamRow): string[] {
   ];
 }
 
-const streamLabel = (row: StreamRow): string =>
-  `${row.config}, ${row.fixture}, ${String(row.maxSegmentMs / 1000)} s max, prompt ${row.prompting ? 'on' : 'off'}`;
+const streamLabel = (row: StreamRow): string => `${row.config}, ${row.fixture}, ${row.variant}`;
 
 function renderStream(): void {
   ui.streamResults.replaceChildren(
@@ -574,44 +592,39 @@ function renderStream(): void {
 }
 
 /**
- * Each fixture through the VAD, then its finals through the guarded decode in order, with and
- * without the previous-text prompt, at the default maximum segment and at a shorter one that forces
- * cuts (the prompt only applies after a forced cut).
+ * Each fixture through the VAD, then its finals through the guarded decode in order. English
+ * fixtures run each variant: the defaults (quiet cut, 2 s overlap, no prompt), then one change at a
+ * time. The others only need to show nothing, so they run the defaults.
  */
 async function runStream(): Promise<void> {
   const loaded = currentModel;
   if (!loaded) return;
-  const maxima = [...new Set([DEFAULT_SEGMENTER.maxSegmentMs, Number(ui.streamMax.value)])];
   showError('');
   setBusy(true);
   try {
     const config = configLabel(loaded.model, loaded.device, loaded.dtype, loaded.threads);
     for (const entry of FIXTURES) {
-      for (const maxSegmentMs of maxima) {
-        const name = `${entry.key}, ${String(maxSegmentMs)} ms max`;
+      const english = entry.language === 'en';
+      for (const variant of english ? STREAM_VARIANTS : STREAM_VARIANTS.slice(0, 1)) {
+        const name = `${entry.key}, ${variant.name}`;
         ui.progress.textContent = `Streaming ${name}: VAD…`;
-        const vad = await runVad(await fixtureCapture(entry), CAPTURE_RATE, 'silero', {
-          maxSegmentMs,
-        });
+        const capture = await fixtureCapture(entry);
+        const vad = await runVad(capture, CAPTURE_RATE, 'silero', variant.tuning);
         const finals = vad.events.filter((event) => event.type === 'final');
-        for (const prompting of [false, true]) {
-          ui.progress.textContent = `Streaming ${name}, prompt ${prompting ? 'on' : 'off'}: decoding ${String(finals.length)} segments…`;
-          const run = await decodeStream(finals, decodeSegment, prompting);
-          streamRows.push({
-            config,
-            fixture: entry.key,
-            maxSegmentMs,
-            prompting,
-            wer:
-              entry.language === 'en'
-                ? wordErrorRate(entry.reference, run.transcript, 'en').rate
-                : null,
-            stats: run.stats,
-            transcript: run.transcript,
-          });
-          store(STREAM_KEY, streamRows);
-          renderStream();
-        }
+        ui.progress.textContent = `Streaming ${name}: decoding ${String(finals.length)} segments…`;
+        const run = await decodeStream(finals, decodeSegment, variant.prompting);
+        const shown = normalizeText(run.transcript, 'en').split(' ').filter(Boolean).length;
+        streamRows.push({
+          config,
+          fixture: entry.key,
+          variant: variant.name,
+          wer: english ? wordErrorRate(entry.reference, run.transcript, 'en').rate : null,
+          wordsShown: english ? null : shown,
+          stats: run.stats,
+          transcript: run.transcript,
+        });
+        store(STREAM_KEY, streamRows);
+        renderStream();
       }
     }
     ui.progress.textContent = `Streaming done: ${config}.`;
@@ -671,19 +684,20 @@ function markdown(): string {
     line([
       'Config',
       'Fixture',
-      'Max segment',
-      'Prompt',
+      'Variant',
       'Segments',
       'Forced cuts',
       'Prompted',
       'WER',
+      'Words shown',
+      'P(en) min / median / max',
       'Loops caught',
       'Loops shown',
       'Retries',
       'Outcomes',
       'Decode (s)',
     ]),
-    line(Array.from({ length: 13 }, () => '---')),
+    line(Array.from({ length: 14 }, () => '---')),
     ...streamRows.map((row) => line(streamCells(row))),
     '',
     ...streamRows.map((row) => `- ${streamLabel(row)}: ${row.transcript}`),
