@@ -169,9 +169,10 @@
       <p class="note">
         Streams each fixture through the VAD, then decodes its segments in order with the guards
         (loops, low confidence, no-speech, English only), dropping the words an overlap repeats.
-        English fixtures run four variants: the defaults (quiet cut, 2 s overlap, no prompt), the
-        previous-text prompt, a hard cut at the maximum, and no overlap. The others should show
-        nothing, so they run the defaults and count the words shown. Needs a loaded model.
+        English fixtures run four variants: the defaults (quiet cut, no overlap, no prompt), the
+        previous-text prompt, a hard cut at the maximum, and a 2 s overlap after each cut. The
+        others should show nothing, so they run the defaults and count the words shown. Needs a
+        loaded model.
       </p>
       <div class="buttons">
         <button id="run-stream" type="button" disabled>Run streaming captions</button>

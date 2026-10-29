@@ -520,7 +520,7 @@ const STREAM_VARIANTS: readonly { name: string; tuning: SegmenterTuning; prompti
   { name: 'default', tuning: {}, prompting: false },
   { name: 'prompt on', tuning: {}, prompting: true },
   { name: 'hard cut', tuning: { cutSearchMs: 0 }, prompting: false },
-  { name: 'no overlap', tuning: { overlapMs: 0 }, prompting: false },
+  { name: '2 s overlap', tuning: { overlapMs: 2_000 }, prompting: false },
 ];
 
 interface StreamRow {
@@ -603,7 +603,7 @@ function renderStream(): void {
 
 /**
  * Each fixture through the VAD, then its finals through the guarded decode in order. English
- * fixtures run each variant: the defaults (quiet cut, 2 s overlap, no prompt), then one change at a
+ * fixtures run each variant: the defaults (quiet cut, no overlap, no prompt), then one change at a
  * time. The others only need to show nothing, so they run the defaults.
  */
 async function runStream(): Promise<void> {

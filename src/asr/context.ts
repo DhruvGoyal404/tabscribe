@@ -7,9 +7,9 @@
 // tokens, only from a decode that passed every guard, and never across a long silence or a change
 // of language (the worker checks the language, since it detects it).
 //
-// The segment after a forced cut also repeats the last 2 s of audio, so a word split by the cut is
-// heard whole once. Its text then starts with words the previous caption already showed, and
-// dropRepeatedPrefix removes them.
+// With an overlap (the segmenter's overlapMs, off by default), the segment after a forced cut
+// repeats the end of the one before, so a word split by the cut is heard whole once. Its text then
+// starts with words the previous caption already showed, and dropRepeatedPrefix removes them.
 import type { EndReason } from '../vad/segmenter';
 import { words, type Verdict } from './guards';
 
