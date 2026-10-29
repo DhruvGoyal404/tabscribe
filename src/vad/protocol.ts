@@ -13,6 +13,7 @@ export type VadKind = 'silero' | 'energy';
 export const TUNABLE = [
   'minSilenceMs',
   'maxSegmentMs',
+  'cutSearchMs',
   'overlapMs',
   'firstPartialMs',
   'partialIntervalMs',

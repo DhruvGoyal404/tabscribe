@@ -10,6 +10,8 @@ const options: Partial<SegmenterOptions> = {
   minSilenceMs: 500,
   padMs: 200,
   maxSegmentMs: 10_000,
+  // One frame: cuts at the forced point, since these samples get louder with their position.
+  cutSearchMs: 100,
   overlapMs: 2_000,
   firstPartialMs: 1_000,
   partialIntervalMs: 2_000,
@@ -25,6 +27,17 @@ function run(probabilities: number[], overrides: Partial<SegmenterOptions> = {})
   });
   events.push(...segmenter.flush());
   return events;
+}
+
+/** Speech at a given loudness per 100 ms frame (0 is a gap between words), then a pause. */
+function runLevels(levels: number[], overrides: Partial<SegmenterOptions> = {}): SegmentEvent[] {
+  const segmenter = new Segmenter({ ...options, cutSearchMs: 2_000, ...overrides });
+  const events: SegmentEvent[] = [];
+  [...levels, ...Array<number>(10).fill(0)].forEach((level, i) => {
+    const frame = new Float32Array(FRAME).fill(level);
+    events.push(...segmenter.push(frame, i < levels.length ? 0.9 : 0));
+  });
+  return [...events, ...segmenter.flush()];
 }
 
 const finals = (events: SegmentEvent[]) => events.filter((e) => e.type === 'final');
@@ -99,6 +112,41 @@ describe('Segmenter', () => {
     ]);
     // The overlap is the same audio, not new samples.
     expect(events[1]?.audio.subarray(0, 200)).toEqual(events[0]?.audio.subarray(800, 1000));
+  });
+
+  it('makes a forced cut after the quietest frame of its last 2 s', () => {
+    // 20 s of speech with a gap between words at 8.5 s, and at 16.0 s.
+    const levels = Array.from({ length: 200 }, (_, i) => (i === 85 || i === 160 ? 0.01 : 0.5));
+    const events = finals(runLevels(levels));
+    expect(events.map((e) => [e.reason, e.startSample, e.endSample, e.overlapSamples])).toEqual([
+      ['max-length', 0, 860, 0], // the gap at 8.5–8.6 s ends the segment
+      ['max-length', 660, 1610, 200], // 2 s back from the cut, then to the gap at 16.0–16.1 s
+      ['silence', 1410, 2020, 200],
+    ]);
+    // Each segment is the stream from its start: the overlap, then what followed the cut.
+    expect(events[1]?.audio.length).toBe(1610 - 660);
+  });
+
+  it('cuts at the forced point when no frame is quieter', () => {
+    const events = finals(runLevels(Array<number>(150).fill(0.5)));
+    expect(events.map((e) => [e.startSample, e.endSample])).toEqual([
+      [0, 1000],
+      [800, 1520],
+    ]);
+  });
+
+  it('keeps a pause that starts after the cut in the next segment', () => {
+    // The quietest frame is at 8.5 s; a pause starts at 9.6 s, after the cut but before 10 s.
+    const segmenter = new Segmenter({ ...options, cutSearchMs: 2_000 });
+    const events: SegmentEvent[] = [];
+    for (let i = 0; i < 110; i++) {
+      const frame = new Float32Array(FRAME).fill(i === 85 ? 0.01 : 0.5);
+      events.push(...segmenter.push(frame, i >= 96 ? 0.1 : 0.9));
+    }
+    expect(finals(events).map((e) => [e.reason, e.endSample, e.speechEndSample])).toEqual([
+      ['max-length', 860, 860],
+      ['silence', 980, 960], // the pause at 9.6 s ended the next segment after 500 ms
+    ]);
   });
 
   it('marks the overlap on the partials after a forced cut too', () => {
