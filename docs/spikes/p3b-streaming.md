@@ -424,7 +424,9 @@ probes (`get_pipeline_files`, the pipeline's progress totals, `get_tokenizer_fil
 revision, so they name `main`, a moving branch, on every load. The weights themselves always
 loaded at the pinned revision. The worker's `env.fetch` now rewrites `/resolve/main/` to the
 pinned revision for catalogue models and answers from the cache first, so **a cached start makes
-no network request**. Worth an upstream issue next to the encoder one.
+no network request**. Upstream already has a fix in review,
+[transformers.js#1751](https://github.com/huggingface/transformers.js/pull/1751); our repro and a
+comment for it are in [the upstream draft](../upstream/transformersjs-probes-ignore-revision.md).
 
 ### Lifecycle
 
