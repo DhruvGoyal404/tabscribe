@@ -80,3 +80,17 @@ test('a status other than listening clears the overlay', async ({ session, injec
   });
   await expect.poll(overlay).toMatchObject({ hidden: true, final: '' });
 });
+
+test('a long caption keeps its newest three lines', async ({ session, inject, overlay }) => {
+  await inject();
+  await session.connected();
+  await session.send(listening);
+  await session.send(caption('final', 0, 'He has grave doubts. '.repeat(40)));
+  await expect.poll(overlay).toMatchObject({ hidden: false });
+  const view = await overlay();
+  if (!view) throw new Error('No overlay');
+  expect(view.textBox.height).toBeGreaterThan(view.clipBox.height);
+  // Three lines of the 2.2vw font at line-height 1.35, and the text's end at the clip's bottom.
+  expect(view.clipBox.height).toBeCloseTo(3 * 1.35 * 0.022 * 1280, -1);
+  expect(view.textBox.bottom).toBeCloseTo(view.clipBox.bottom, 0);
+}); // prettier-ignore
