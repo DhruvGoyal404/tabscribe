@@ -173,6 +173,29 @@ async function main() {
     lastPartial = partial;
   }
   log('caption status at the end:', await text('caption-status'));
+  // The overlay's text, from inside its closed shadow root (the DevTools protocol can pierce it).
+  const tabCdp = await tab.context().newCDPSession(tab);
+  const overlayText = async () => {
+    const { root } = await tabCdp.send('DOM.getDocument', { depth: -1, pierce: true });
+    const walk = (node) => {
+      if (node.localName === 'tabscribe-overlay') return node;
+      for (const child of [...(node.children ?? []), ...(node.shadowRoots ?? [])]) {
+        const found = walk(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    const host = walk(root);
+    if (!host) return null;
+    const texts = [];
+    const collect = (node) => {
+      if (node.nodeType === 3) texts.push(node.nodeValue);
+      for (const child of [...(node.children ?? []), ...(node.shadowRoots ?? [])]) collect(child);
+    };
+    collect(host);
+    return `${host.shadowRoots?.[0]?.shadowRootType} root: ${texts.join('').trim()}`;
+  };
+  log('overlay on the tab:', await overlayText());
   log(`finals: ${String(finals.length)}, partial updates seen: ${String(partials)}`);
   log('transcript:', finals.join(' '));
 
@@ -181,6 +204,7 @@ async function main() {
   const contexts = await sw(
     async () => (await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] })).length,
   );
+  log('after Stop, overlay:', (await overlayText()) ?? 'gone');
   log('after Stop, offscreen documents:', contexts, '| state:', JSON.stringify(await sw(async () => (await chrome.storage.session.get('captureState')).captureState)));
   log('webgpuFailure stored:', JSON.stringify(await sw(async () => (await chrome.storage.local.get('webgpuFailure')).webgpuFailure ?? null)));
   cdp.close();
