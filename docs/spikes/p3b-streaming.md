@@ -9,8 +9,8 @@ fallback WASM q8/q8). Built in PR-sized pieces. This doc grows with each piece.
 | 1b    | Cross-origin isolation for multithreaded WASM, bench thread selector                       | PR #11   |
 | 1c    | Chrome stable results, the q8 step-count check, features for the real audio only           | PR #12   |
 | 2     | ASR side: segment queue, repetition and no-speech guards, interruptible partials, ordering | PR #13   |
-| 3     | Wiring: worklet → VAD → ASR in the offscreen document, runtime backend choice, consent     | **this** |
-| 4     | Popup debug transcript, live bench mode (latency p50/p95), regression fixture, memory      |          |
+| 3     | Wiring: worklet → VAD → ASR in the offscreen document, runtime backend choice, consent     | PR #14   |
+| 4     | Tuning: quiet cut, overlap, English threshold; live bench mode, regression fixtures        | **this** |
 
 ## Pipeline
 
@@ -456,6 +456,140 @@ creation and the warm-up decode. All seven sentences of the fixture were caption
 as the VAD's seven natural segments. Caption latency isn't measured here: piece 4's live bench
 mode does p50/p95.
 
+## Piece 4: tuning and live mode
+
+### From the Chrome stable test of piece 3
+
+A live test on an English podcast (Chrome 155, Windows, Intel gen-12lp) passed the piece 3
+checklist, with captions 1–2 s behind the speech. It found four problems:
+
+1. **A phrase shown twice at a boundary** ("…cracking something open. of cracking something open
+   and sharing…"). After a forced cut the next segment repeated the last 2 s, and the scheduler
+   de-duplicated finals but not partials, so the partial repeated what the final had just shown.
+   Partials now carry their overlap and are de-duplicated too. With the overlap now off by default
+   (below), there's nothing left to repeat.
+2. **A word lost at a boundary** ("hidden away in the rather than"). A forced cut at exactly
+   10 s split a word, and the repeated audio came back decoded differently. The same thing shows on
+   the new continuous fixture: "addresses deniguring authorities. that they prevent" drops "calling
+   for reform of the security forces, to make sure". The quiet cut and no overlap (below) fix that
+   case. Words still go missing at some cuts (see the remaining errors).
+3. **The consent and the "Download … and start" button stayed** after the download until the popup
+   was reopened. The popup now treats a "listening" status for its planned device as the model
+   being cached, and never offers the download while the current tab is capturing.
+4. **No speed or ETA during the first download** (about 4 min at 0.6 MB/s). The loading status now
+   carries the rate over the last 10 s, and the popup shows "Downloading the speech model: 40.0 of
+   148.8 MB, 0.6 MB/s, about 3 min left".
+
+Checked end to end with [p3b-captions-probe.mjs](./p3b-captions-probe.mjs) on a fresh profile:
+during the download the popup showed "22.8 of 148.8 MB, 2.2 MB/s, about 60 s left"; once
+listening, without reopening it, the consent was hidden and the button read "Start"; 7 of 7 finals.
+Playwright's Chromium 156.0.8078.4 (build 1248) opened no popup on `Extensions.triggerAction`, so
+the probe ran on build 1243. On a busy machine the popup's first plan sometimes took over 10 s, so
+the probe now waits up to 60 s for it.
+
+### Regression fixtures
+
+The bench now has three more fixtures, listed with sources and licences in
+[the fixtures README](../../src/bench/fixtures/README.md):
+
+| Fixture     | What                                                                  | Expect       |
+| ----------- | --------------------------------------------------------------------- | ------------ |
+| `en-vp`     | 126 s of parliamentary English (VoxPopuli, CC0), 4 speakers, accented | 14 real cuts |
+| `fr-de`     | 3 French and 3 German sentences (FLEURS)                              | nothing      |
+| `nonspeech` | 20 s instrumental music, 10 s silence, 20 s background noise (MUSAN)  | nothing      |
+
+`en-vp` speaks for more than 10 s without a 500 ms pause, so the segmenter makes real forced cuts
+at the default maximum, which the LibriSpeech fixture never did. Nothing was shown for `hi`,
+`fr-de` or `nonspeech` in any run: the VAD cut no segment at all from the music, silence or noise,
+and every Hindi, French and German segment came out `not-english`.
+
+### Forced cuts: quiet cut, overlap, prompt
+
+**The quiet cut.** A segment that reaches the maximum now ends after the quietest 32 ms frame (by
+RMS) of its last 2 s, as Silero's `get_speech_timestamps` splits at its last silence, instead of
+at exactly 10 s. `cutSearchMs: 0` gives the old hard cut.
+
+Streaming captions on `en-vp`, Chromium, whisper-base. Two runs per backend; the defaults changed
+between them, so the "2 s overlap" variant is the first run's default:
+
+| Variant                         |   WebGPU fp16, WER |       WASM q8, WER |
+| ------------------------------- | -----------------: | -----------------: |
+| Hard cut, 2 s overlap (piece 3) |             18.6 % |             25.5 % |
+| Quiet cut, 2 s overlap          |     19.3 %, 18.3 % |     21.6 %, 19.0 % |
+| Quiet cut, 2 s overlap, prompt  |             24.5 % |             28.8 % |
+| Quiet cut, no overlap, prompt   |             15.7 % |             18.3 % |
+| Hard cut, no overlap            |             16.3 % |             21.2 % |
+| **Quiet cut, no overlap**       | **14.4 %, 14.4 %** | **17.0 %, 17.0 %** |
+
+- **The overlap did more harm than good.** The repeated 2 s is decoded a second time and comes out
+  differently, so the de-dup can't always match it: it doubled words ("the eleventh 11th EDF"),
+  invented some ("in formulating EU policies, The following is a formulating EU policies") and lost
+  the clause above. Once the cut falls between words, there's little left for the overlap to save.
+- **The quiet cut helps once the overlap is gone:** 14.4 % against 16.3 % on WebGPU, 17.0 % against
+  21.2 % on WASM.
+- **The prompt still loses**, by 1.3 points without the overlap and by 5–7 points with it. With the
+  overlap it once produced a varied repeat ("cannot find a doctor or a doctor or doctor or a
+  patient or doctor") that the loop guard missed, since no phrase repeats exactly three times.
+- Shipped in piece 3 → now: **18.6 % → 14.4 % on WebGPU, 25.5 % → 17.0 % on WASM.** LibriSpeech
+  (`en`) has no forced cuts and stays at 5.3 % and 8.0 %.
+
+**Decision:** quiet cut, **no overlap** (`overlapMs` now defaults to 0), **prompt off**. The overlap
+and the de-dup stay in the code for a non-zero `overlapMs`, which the bench still runs as a
+variant.
+
+Remaining errors at the cuts: Whisper still drops a word or two at some segment edges ("by
+stealing public money intended for" → "but still in public money. for"), and it ends a segment
+cut mid-sentence with a full stop. Candidates for later: a shorter overlap (0.3–0.5 s,
+enough for one word), or cutting only at frames Silero scores below the end threshold.
+
+### The English threshold
+
+P(English) per segment, from the language step, across both runs and both backends:
+
+| Fixture                        | Segments | P(en) range |
+| ------------------------------ | -------: | ----------- |
+| `en` (native, read)            |        7 | 0.99–1.00   |
+| `en-vp` (accented, continuous) |    14–18 | 0.27–0.96   |
+| `hi`                           |        6 | 0.00–0.14   |
+| `fr-de`                        |      7–8 | 0.00–0.08   |
+
+At 0.25, the threshold sat close to real English (0.27 at the lowest). **It's now 0.2**, near the
+geometric middle of 0.14 and 0.27. The margin is thin on both sides: an accented speaker below 0.2
+loses a caption, and a non-English segment above it is decoded as English. More data would help,
+but on these fixtures no English segment is dropped and nothing else is shown.
+
+### Live mode: caption latency and memory
+
+The bench's **Run live captions** plays a fixture at real-time pace (2048-sample chunks at
+48 kHz, as the capture tap posts them) through the VAD worker and `CaptionScheduler`, with the
+extension's options for the loaded device: partials on WebGPU, merged finals on WASM. A final's
+delay runs from where its speech ended (the pause, or the forced cut) to when it's shown. A
+partial's runs from the end of the audio it previews.
+
+Chromium under automation, quiet machine, defaults as decided above:
+
+| Config      | Fixture | Final p50 | Final p95 | Partial p50 | Partial p95 | Memory |
+| ----------- | ------- | --------: | --------: | ----------: | ----------: | -----: |
+| WebGPU fp16 | `en-vp` | 4.0–4.8 s | 5.7–7.4 s |   1.7–2.4 s |   2.6–3.1 s | 590 MB |
+| WebGPU fp16 | `en`    |     3.0 s |     4.5 s |       1.5 s |       2.6 s | 590 MB |
+| WASM q8     | `en-vp` |     4.6 s |     6.9 s |           — |           — | 420 MB |
+| WASM q8     | `en`    |     3.6 s |     5.3 s |           — |           — | 430 MB |
+
+- **The machine matters as much as the backend here.** One WebGPU run while other apps were busy
+  gave 8.7 s / 13.6 s on `en-vp`; its streaming decodes also took 60 % longer than the identical
+  first run. The numbers above are from runs with less load (WebGPU: three runs, the range shown). Under automation, CPU work also ran about 2×
+  slower than a normal Chrome window (piece 1), so Chrome stable should do better.
+- **A forced cut's delay includes up to 2 s of look-back**: the quiet cut is decided when the
+  segment reaches 10 s, but it falls up to 2 s earlier, and the delay counts from there.
+- **What a viewer sees first is the partial**, 1.5–2.4 s behind the speech at p50 on WebGPU. That
+  matches the "1–2 s" from the Chrome stable test.
+- **WASM has no slack on continuous speech.** The run on the busy machine gave 6.2 s / 15.3 s on
+  `en-vp`: with no pause to catch up, finals queued behind 2–5 s decodes and the backlog grew until
+  the speaker changed. Merging queued finals into one call bounds it, but a slow machine shows it.
+- **Memory** is `measureUserAgentSpecificMemory` after the run: the page's and its workers' JS and
+  WASM heaps. On WASM that includes the q8 weights. GPU buffers aren't counted, so WebGPU's real
+  footprint is higher.
+
 ## How to re-measure on Chrome stable
 
 1. On `main`, run `npm ci` and `npm run build:bench`, then reload the `dist-bench` extension in
@@ -464,6 +598,8 @@ mode does p50/p95.
    check that `crossOriginIsolated` is `true` and **Default ORT threads** shows `4 threads`.
 3. Click **Clear per-call results**, select a model, device and dtypes, set **Threads**, click
    **Load model**, then **Measure per-call cost**. Repeat for each config.
-4. For piece 2, load a model and click **Run streaming captions** (a few minutes on WASM).
+4. For pieces 2 and 4, load a model and click **Run streaming captions** (10–15 minutes on WASM).
+   Then pick a fixture under **Live captions** and click **Run live captions**, once per fixture
+   (`en-vp` takes just over 2 minutes in real time).
 5. Click **Copy results as Markdown**. The streaming captions are in the export; the per-call
    decoded texts aren't (open **Decoded text** under the per-call table).
