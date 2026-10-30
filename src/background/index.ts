@@ -21,6 +21,8 @@ import {
   type Reply,
 } from '../shared/messages';
 import { badgeRefresh, badgeUpdates, mutedChange } from './tab-sync';
+// One self-contained file (IIFE): nothing to load from the extension, so no web-accessible files.
+import overlayScript from '../overlay/overlay.ts?iife';
 
 const OFFSCREEN_PATH = 'src/offscreen/index.html';
 const BADGE_COLOR = '#1f5ed6';
@@ -128,6 +130,20 @@ async function startCapture(
   } catch (error) {
     await fail(error);
     throw error;
+  }
+  // After the offscreen document is up, so the overlay's port has somewhere to connect.
+  await showOverlay(tabId);
+}
+
+/**
+ * Injects the caption overlay into the captured tab, under the activeTab grant from the popup
+ * click. Captions go on in the popup if this fails (a page scripts can't run in, for example).
+ */
+async function showOverlay(tabId: number): Promise<void> {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: [overlayScript] });
+  } catch (error) {
+    console.warn('[tabscribe] no caption overlay on this page:', describeError(error));
   }
 }
 
