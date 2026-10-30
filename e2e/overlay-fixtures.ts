@@ -42,7 +42,9 @@ const CSP = "default-src 'self'; script-src 'self'; style-src 'self'";
 const PAGES: Record<string, string> = {
   '/': `<!doctype html><title>Video page</title>
     <link rel="stylesheet" href="/page.css">
-    <div id="player"><p>Video</p></div>`,
+    <div id="player"><p>Video</p></div>
+    <video id="bare"></video>
+    <iframe id="embed" src="/other"></iframe>`,
   '/other': `<!doctype html><title>Other page</title><p>Other</p>`,
 };
 // Tries to hide anything it doesn't own: the overlay's host must survive this.

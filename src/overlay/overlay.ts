@@ -7,6 +7,8 @@
 //   doesn't govern, unlike a <style> element or a style attribute in markup.
 // - It shows what the offscreen document sends over the overlay port, and removes itself when
 //   that port closes: Stop, the end of the capture, or the extension reloading.
+// - A fullscreen page shows only its top layer, so the overlay moves into the fullscreen element.
+//   A <video> or <iframe> doesn't render children: there it goes on top as a popover instead.
 import { isCaptionMessage } from '../shared/captions';
 import { OVERLAY_PORT } from '../shared/messages';
 import { applyCaption, applyStatus, EMPTY, type OverlayText } from './text';
@@ -60,6 +62,7 @@ function mount(): void {
   host.style.setProperty('inset', '0', 'important');
   host.style.setProperty('z-index', '2147483647', 'important');
   host.style.setProperty('pointer-events', 'none', 'important');
+  host.popover = 'manual';
 
   const root = host.attachShadow({ mode: 'closed' });
   const sheet = new CSSStyleSheet();
@@ -79,7 +82,17 @@ function mount(): void {
   lines.append(line);
   box.append(lines);
   root.append(box);
-  document.documentElement.append(host);
+
+  const follow = () => {
+    const target = document.fullscreenElement;
+    (target ?? document.documentElement).append(host); // moving it also closes a popover
+    if (target && !host.checkVisibility()) {
+      document.documentElement.append(host);
+      host.showPopover();
+    }
+  };
+  follow();
+  document.addEventListener('fullscreenchange', follow);
 
   let text: OverlayText = EMPTY;
   const show = () => {
@@ -92,6 +105,7 @@ function mount(): void {
   const instance = {
     remove() {
       port.disconnect();
+      document.removeEventListener('fullscreenchange', follow);
       host.remove();
       if (global[INSTANCE] === instance) global[INSTANCE] = undefined;
     },

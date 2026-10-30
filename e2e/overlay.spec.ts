@@ -94,3 +94,43 @@ test('a long caption keeps its newest three lines', async ({ session, inject, ov
   expect(view.clipBox.height).toBeCloseTo(3 * 1.35 * 0.022 * 1280, -1);
   expect(view.textBox.bottom).toBeCloseTo(view.clipBox.bottom, 0);
 }); // prettier-ignore
+
+for (const { id, parent, popover } of [
+  { id: 'player', parent: 'player', popover: false },
+  { id: 'bare', parent: 'HTML', popover: true },
+  { id: 'embed', parent: 'HTML', popover: true },
+]) {
+  test(`captions show over a fullscreen #${id}`, async ({ page, session, inject, overlay }) => {
+    const place = () =>
+      page.evaluate<{ parent: string; popover: boolean }>(`(() => {
+        const host = document.querySelector('tabscribe-overlay');
+        const parent = host.parentElement;
+        return { parent: parent.id || parent.tagName, popover: host.matches(':popover-open') };
+      })()`);
+    const enter = () => page.evaluate(`document.getElementById('${id}').requestFullscreen()`);
+
+    await page.bringToFront();
+    await inject();
+    await session.connected();
+    await session.send(listening);
+
+    await enter();
+    await expect.poll(place).toEqual({ parent, popover });
+    const empty = await page.screenshot();
+    await session.send(caption('final', 0, 'Hello there.'));
+    await expect.poll(overlay).toMatchObject({ hidden: false });
+    // It's painted: this is what a top layer stacked the wrong way would fail.
+    expect((await page.screenshot()).equals(empty)).toBe(false);
+    await session.send({
+      type: 'captions/status',
+      status: { state: 'error', plan: listening.status.plan, message: 'gone' },
+    });
+    await expect.poll(overlay).toMatchObject({ hidden: true });
+    expect((await page.screenshot()).equals(empty)).toBe(true);
+
+    await page.evaluate(`document.exitFullscreen()`);
+    await expect.poll(place).toEqual({ parent: 'HTML', popover: false });
+    await enter();
+    await expect.poll(place).toEqual({ parent, popover });
+  });
+}
