@@ -3,7 +3,8 @@
 // - the manifest keeps exactly the approved permissions, no host permissions, the approved CSP and
 //   cross-origin isolation;
 // - nothing from the dev-only bench (page, fixtures) leaked in, and no Whisper weights;
-// - the caption workers, ONNX Runtime and the Silero VAD model are there.
+// - the caption workers, ONNX Runtime and the Silero VAD model are there;
+// - the caption overlay is there, and nothing is web-accessible (a page could detect the extension).
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,6 +32,7 @@ const REQUIRED = [
   /^assets\/vad\.worker-/,
   /^assets\/ort-wasm-/,
   /^assets\/silero_vad_16k_op15-/,
+  /^src\/overlay\/overlay\.js$/,
 ];
 
 const problems = [];
@@ -41,7 +43,12 @@ if (JSON.stringify(manifest.permissions) !== JSON.stringify(PERMISSIONS)) {
     `permissions are ${JSON.stringify(manifest.permissions)}, expected ${JSON.stringify(PERMISSIONS)}`,
   );
 }
-for (const key of ['host_permissions', 'optional_permissions', 'optional_host_permissions']) {
+for (const key of [
+  'host_permissions',
+  'optional_permissions',
+  'optional_host_permissions',
+  'web_accessible_resources',
+]) {
   if (key in manifest) problems.push(`manifest has ${key}: ${JSON.stringify(manifest[key])}`);
 }
 if (manifest.content_security_policy?.extension_pages !== CSP) {
@@ -66,6 +73,15 @@ for (const file of files) {
   }
 }
 
+// Two entry files with the same name once made crxjs load the overlay as the service worker, which
+// left it without listeners. The worker's code must be the background's, not the overlay's.
+const loader = await readFile(path.join(DIST, 'service-worker-loader.js'), 'utf8');
+const workerChunk = /import '\.\/(assets\/[^']+)'/.exec(loader)?.[1];
+const workerCode = workerChunk ? await readFile(path.join(DIST, workerChunk), 'utf8') : '';
+if (!workerCode.includes('onMessage') || workerCode.includes('tabscribe-overlay')) {
+  problems.push(`the service worker loads ${String(workerChunk)}, which isn't the background`);
+}
+
 for (const pattern of REQUIRED) {
   if (!files.some((file) => pattern.test(file))) problems.push(`missing from dist/: ${pattern}`);
 }
@@ -75,5 +91,5 @@ if (problems.length > 0) {
   process.exit(1);
 }
 console.log(
-  `✓ dist/ (${String(files.length)} files): approved permissions, CSP and isolation, caption runtime, no dev-only files.`,
+  `✓ dist/ (${String(files.length)} files): approved permissions, CSP and isolation, caption runtime and overlay, nothing web-accessible, no dev-only files.`,
 );

@@ -8,6 +8,7 @@ import { LEVEL_METER_PROCESSOR } from '../shared/level';
 import {
   isLevel,
   isMessage,
+  OVERLAY_PORT,
   SESSION_PORT,
   settle,
   type LevelMessage,
@@ -26,6 +27,8 @@ interface Session {
 
 let session: Session | null = null;
 const sessionPorts = new Set<chrome.runtime.Port>();
+/** The session ports that belong to the overlay in the captured tab. */
+const overlayPorts = new WeakSet<chrome.runtime.Port>();
 
 /** What a popup that connects mid-session needs to catch up. */
 const latest: { status: CaptionStatus | null; final: Caption | null; partial: Caption | null } = {
@@ -144,15 +147,20 @@ function send(port: chrome.runtime.Port, message: SessionMessage): void {
 }
 
 function broadcast(message: SessionMessage): void {
-  for (const port of sessionPorts) send(port, message);
+  for (const port of sessionPorts) {
+    // The overlay lives in a web page: it gets captions, not the meter's stream of levels.
+    if (message.type !== 'level' || !overlayPorts.has(port)) send(port, message);
+  }
 }
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.sender?.id !== chrome.runtime.id || port.name !== SESSION_PORT) {
+  const overlay = port.name === OVERLAY_PORT;
+  if (port.sender?.id !== chrome.runtime.id || (port.name !== SESSION_PORT && !overlay)) {
     port.disconnect();
     return;
   }
   sessionPorts.add(port);
+  if (overlay) overlayPorts.add(port);
   port.onDisconnect.addListener(() => sessionPorts.delete(port));
   if (latest.status) send(port, { type: 'captions/status', status: latest.status });
   for (const caption of [latest.final, latest.partial]) {

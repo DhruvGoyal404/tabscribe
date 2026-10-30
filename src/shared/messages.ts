@@ -41,6 +41,8 @@ export type Reply = { ok: true } | { ok: false; error: string };
 
 /** Offscreen document -> popup: levels, and caption status and captions (captions.ts). */
 export const SESSION_PORT = 'session';
+/** Offscreen document -> the overlay in the captured tab: caption status and captions only. */
+export const OVERLAY_PORT = 'overlay';
 
 const MAX_STREAM_ID_LENGTH = 512;
 const MAX_ERROR_LENGTH = 1000;
