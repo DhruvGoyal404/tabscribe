@@ -112,13 +112,17 @@ async function main() {
   });
   if (run.error) throw new Error(run.error.message);
   let popup;
-  for (let i = 0; i < 40 && !popup; i++) {
+  // A loaded machine can take a while to show the popup.
+  for (let i = 0; i < 160 && !popup; i++) {
     await sleep(250);
     popup = (await targets()).find(
       (t) => !before.has(t.targetId) && t.type === 'page' && t.url.endsWith('/src/popup/index.html'),
     );
   }
-  if (!popup) throw new Error('popup did not open');
+  if (!popup) {
+    const added = (await targets()).filter((t) => !before.has(t.targetId));
+    throw new Error(`popup did not open; new targets: ${JSON.stringify(added.map((t) => [t.type, t.url]))}; triggerAction: ${JSON.stringify(run)}`);
+  }
   const { sessionId } = (
     await cdp.send('Target.attachToTarget', { targetId: popup.targetId, flatten: true })
   ).result;
@@ -126,7 +130,7 @@ async function main() {
     (await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId))
       .result?.result?.value;
   const text = (id) => evaluate(`document.getElementById('${id}').textContent`);
-  for (let i = 0; i < 40 && /Checking/.test(await text('plan')); i++) await sleep(250);
+  for (let i = 0; i < 240 && /Checking/.test(await text('plan')); i++) await sleep(250);
 
   log('plan:', await text('plan'));
   log('consent:', (await evaluate(`document.getElementById('consent').hidden`)) ? '(hidden: cached)' : await text('consent'));
@@ -145,6 +149,9 @@ async function main() {
   }
   log(`status after ${((Date.now() - clicked) / 1000).toFixed(1)} s:`, status);
   if (!/Listening/.test(status)) throw new Error(`captions did not start: ${status}`);
+  // Once the model is ready the download offer goes, without reopening the popup.
+  const consentHidden = await evaluate(`document.getElementById('consent').hidden`);
+  log('while listening: consent', consentHidden ? 'hidden' : 'STILL SHOWN', '| start button:', await text('start'));
   const played = Date.now();
   await tab.evaluate(() => document.getElementById('speech').play());
 
