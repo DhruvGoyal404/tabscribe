@@ -7,28 +7,40 @@
 //   doesn't govern, unlike a <style> element or a style attribute in markup.
 // - It shows what the offscreen document sends over the overlay port, and removes itself when
 //   that port closes: Stop, the end of the capture, or the extension reloading.
+// - A fullscreen page shows only its top layer, so the overlay moves into the fullscreen element.
+//   A <video> or <iframe> doesn't render children: there it goes on top as a popover instead.
 import { isCaptionMessage } from '../shared/captions';
 import { OVERLAY_PORT } from '../shared/messages';
 import { applyCaption, applyStatus, EMPTY, type OverlayText } from './text';
 
+// Sizes are in px and viewport units, not rem, which would follow the page's root font size.
+// White on 0.8 black stays above 12:1 even on a white page, and a partial above 7:1.
 const CSS = `
   .captions {
     position: fixed;
-    left: 50%;
-    bottom: 6vh;
-    transform: translateX(-50%);
-    max-width: min(90vw, 60rem);
+    inset-inline: 0;
+    bottom: max(8vh, 72px); /* clear of a player's controls */
+    width: fit-content;
+    max-width: min(90vw, 34em);
+    margin-inline: auto;
     padding: 0.4em 0.7em;
     border-radius: 0.3em;
     background: rgb(0 0 0 / 0.8);
     color: #fff;
-    font: 500 clamp(16px, 2.4vw, 28px) / 1.35 system-ui, sans-serif;
+    font: 500 clamp(18px, 2.2vw, 36px) / 1.35 system-ui, sans-serif;
     text-align: center;
-    white-space: pre-wrap;
     pointer-events: none;
   }
   .captions[hidden] {
     display: none;
+  }
+  /* Three lines at most, anchored at the end: the oldest text goes first. */
+  .lines {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    max-height: 3lh;
+    overflow: hidden;
   }
   .partial {
     opacity: 0.7;
@@ -50,6 +62,7 @@ function mount(): void {
   host.style.setProperty('inset', '0', 'important');
   host.style.setProperty('z-index', '2147483647', 'important');
   host.style.setProperty('pointer-events', 'none', 'important');
+  host.popover = 'manual';
 
   const root = host.attachShadow({ mode: 'closed' });
   const sheet = new CSSStyleSheet();
@@ -61,9 +74,25 @@ function mount(): void {
   const final = document.createElement('span');
   const partial = document.createElement('span');
   partial.className = 'partial';
-  box.append(final, ' ', partial);
+  const lines = document.createElement('div');
+  lines.className = 'lines';
+  const line = document.createElement('div');
+  line.className = 'text';
+  line.append(final, ' ', partial);
+  lines.append(line);
+  box.append(lines);
   root.append(box);
-  document.documentElement.append(host);
+
+  const follow = () => {
+    const target = document.fullscreenElement;
+    (target ?? document.documentElement).append(host); // moving it also closes a popover
+    if (target && !host.checkVisibility()) {
+      document.documentElement.append(host);
+      host.showPopover();
+    }
+  };
+  follow();
+  document.addEventListener('fullscreenchange', follow);
 
   let text: OverlayText = EMPTY;
   const show = () => {
@@ -76,6 +105,7 @@ function mount(): void {
   const instance = {
     remove() {
       port.disconnect();
+      document.removeEventListener('fullscreenchange', follow);
       host.remove();
       if (global[INSTANCE] === instance) global[INSTANCE] = undefined;
     },
