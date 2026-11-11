@@ -279,7 +279,7 @@ const GPU_INFO_KEYS = [
   'maxStorageBufferBindingSize',
 ];
 
-const isGpuInfo = (value: unknown): value is GpuInfo => {
+export const isGpuInfo = (value: unknown): value is GpuInfo => {
   if (!isRecord(value)) return false;
   if (value.available === false) {
     return hasExactKeys(value, ['available', 'reason']) && isShortString(value.reason);
