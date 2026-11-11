@@ -18,6 +18,9 @@ import {
   type Message,
 } from '../shared/messages';
 
+// Startup timing, readable in DevTools (performance.getEntriesByType('mark')).
+performance.mark('popup:script');
+
 const METER_FLOOR_DBFS = -60;
 
 function element<T extends HTMLElement>(id: string, type: new () => T): T {
@@ -237,7 +240,9 @@ async function init(): Promise<void> {
   const stored: unknown = (await chrome.storage.session.get(STATE_KEY))[STATE_KEY];
   state = isCaptureState(stored) ? stored : IDLE;
   render();
+  performance.mark('popup:state');
   await refreshPlan();
+  performance.mark('popup:plan');
 }
 
 void init();
