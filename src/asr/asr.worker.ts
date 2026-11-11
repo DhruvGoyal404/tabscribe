@@ -21,11 +21,10 @@ import {
   pipeline,
   Tensor,
   type AutomaticSpeechRecognitionPipeline,
-  type ProgressInfo,
 } from '@huggingface/transformers';
 import ortWasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url';
 import { GeneratedNoRepeatNGram, Interrupt, logProbability, TokenLogprobs } from './decoding';
-import { gpuInfo } from './gpu';
+import { gpuInfo, IGNORES_POWER_PREFERENCE } from './gpu';
 import { skipPaddingFrames, type WhisperFeatureExtractorLike } from './features';
 import {
   compressionRatio,
@@ -58,6 +57,8 @@ env.useWasmCache = false;
 env.experimental_useCrossOriginStorage = false;
 /** Set per load from its request. */
 let downloadsAllowed = false;
+/** The load whose downloads report progress. */
+let loadId: number | null = null;
 const networkFetch = env.fetch;
 // Every request Transformers.js makes, pinned to our revision (some of its probes name `main`),
 // answered from the model cache when possible, and refused unless this load may download.
@@ -67,12 +68,51 @@ env.fetch = async (input, init) => {
     .open(MODEL_CACHE)
     .then((cache) => cache.match(url))
     .catch(() => undefined);
-  if (cached) return cached;
+  if (cached) {
+    // Counted as loaded, so a download that finds some files cached still reaches its total.
+    const size = contentLength(cached);
+    if (loadId !== null)
+      post({ type: 'progress', id: loadId, file: url, loaded: size, total: size });
+    return cached;
+  }
   if (!downloadsAllowed) throw new Error(`ModelNotDownloaded: ${url} isn't cached`);
-  return (await networkFetch(url, init)) as Response;
+  const response = (await networkFetch(url, init)) as Response;
+  return loadId === null ? response : counted(response, url, loadId);
 };
+
+const contentLength = (response: Response): number =>
+  Number(response.headers.get('content-length')) || 0;
+
+/**
+ * Reports a download's progress as its body is read. Counted here, not with Transformers.js's
+ * progress_callback, which first probes every file's size: refused by the fetch above when the
+ * model is cached, and logged as a warning on every start. The offscreen document
+ * takes the total from our catalogue.
+ */
+function counted(response: Response, file: string, id: number): Response {
+  if (!response.body) return response;
+  const total = contentLength(response);
+  let loaded = 0;
+  const body = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        loaded += chunk.byteLength;
+        post({ type: 'progress', id, file, loaded, total });
+        controller.enqueue(chunk);
+      },
+    }),
+  );
+  // Same status and headers (Transformers.js sizes its buffer from content-length).
+  return new Response(body, response);
+}
+
 const onnxWasm = env.backends.onnx.wasm;
 if (onnxWasm) onnxWasm.wasmPaths = { wasm: new URL(ortWasmUrl, self.location.href).href };
+// Transformers.js sets high-performance for ONNX Runtime's own requestAdapter(); see gpu.ts. Its
+// replacement, passing ORT a device of our own, would also take over the features ORT asks for.
+const onnxWebgpu = env.backends.onnx.webgpu;
+// eslint-disable-next-line @typescript-eslint/no-deprecated -- removing it, as above
+if (onnxWebgpu && IGNORES_POWER_PREFERENCE) delete onnxWebgpu.powerPreference;
 
 /** Whisper decodes in 30 s windows; language detection looks at the first one. */
 const WINDOW_SECONDS = 30;
@@ -105,22 +145,16 @@ async function load(request: Extract<WorkerRequest, { type: 'load' }>): Promise<
   downloadsAllowed = request.allowDownload;
   const { id, revision } = MODELS[request.model];
   const started = performance.now();
-  asr = await pipeline('automatic-speech-recognition', id, {
-    revision,
-    device: request.device,
-    dtype: { encoder_model: request.dtype.encoder, decoder_model_merged: request.dtype.decoder },
-    progress_callback: (progress: ProgressInfo) => {
-      if (progress.status === 'progress') {
-        post({
-          type: 'progress',
-          id: request.id,
-          file: progress.file,
-          loaded: progress.loaded,
-          total: progress.total,
-        });
-      }
-    },
-  });
+  loadId = request.id;
+  try {
+    asr = await pipeline('automatic-speech-recognition', id, {
+      revision,
+      device: request.device,
+      dtype: { encoder_model: request.dtype.encoder, decoder_model_merged: request.dtype.decoder },
+    });
+  } finally {
+    loadId = null;
+  }
   allowPrecomputedEncoderOutput(asr);
   skipPaddingFrames(asr.processor.feature_extractor as unknown as WhisperFeatureExtractorLike);
   checkSpecialTokens(asr);

@@ -42,7 +42,9 @@ const CSP = "default-src 'self'; script-src 'self'; style-src 'self'";
 const PAGES: Record<string, string> = {
   '/': `<!doctype html><title>Video page</title>
     <link rel="stylesheet" href="/page.css">
-    <div id="player"><p>Video</p></div>`,
+    <div id="player"><p>Video</p></div>
+    <video id="bare"></video>
+    <iframe id="embed" src="/other"></iframe>`,
   '/other': `<!doctype html><title>Other page</title><p>Other</p>`,
 };
 // Tries to hide anything it doesn't own: the overlay's host must survive this.
@@ -107,9 +109,18 @@ export interface OverlayView {
   hidden: boolean;
   final: string;
   partial: string;
+  /** The text's box and the box clipping it, in page pixels. */
+  textBox: Box;
+  clipBox: Box;
+}
+
+export interface Box {
+  height: number;
+  bottom: number;
 }
 
 interface DomNode {
+  nodeId: number;
   nodeType: number;
   localName?: string;
   nodeValue?: string;
@@ -193,12 +204,23 @@ export const test = base.extend<Fixtures>({
       const shadow = host?.shadowRoots?.[0];
       if (!shadow) return null;
       const box = find(shadow, (node) => node.attributes?.includes('captions') ?? false);
-      const spans = box?.children?.filter((child) => child.localName === 'span') ?? [];
+      const line = box && find(box, (node) => node.attributes?.includes('text') ?? false);
+      const clip = box && find(box, (node) => node.attributes?.includes('lines') ?? false);
+      const spans = line?.children?.filter((child) => child.localName === 'span') ?? [];
+      const boxOf = async (node: DomNode | undefined): Promise<Box> => {
+        if (box?.attributes?.includes('hidden') !== false || !node) return { height: 0, bottom: 0 };
+        const { model } = (await cdp.send('DOM.getBoxModel', { nodeId: node.nodeId })) as {
+          model: { height: number; content: number[] };
+        };
+        return { height: model.height, bottom: model.content[5] ?? 0 };
+      };
       return {
         shadowRootType: shadow.shadowRootType ?? '',
         hidden: box?.attributes?.includes('hidden') ?? true,
         final: text(spans[0]),
         partial: text(spans[1]),
+        textBox: await boxOf(line),
+        clipBox: await boxOf(clip),
       };
     });
   },

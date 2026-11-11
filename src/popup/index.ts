@@ -7,6 +7,7 @@ import {
 } from '../asr/backend';
 import { gpuInfo } from '../asr/gpu';
 import { isCached } from '../asr/models';
+import { isGpuInfo, type GpuInfo } from '../asr/protocol';
 import { IDLE, isCaptureState, STATE_KEY, type CaptureState } from '../shared/capture-state';
 import { describeStatus, isCaptionMessage, type Caption } from '../shared/captions';
 import { MIN_DBFS } from '../shared/level';
@@ -17,6 +18,9 @@ import {
   WEBGPU_FAILURE_KEY,
   type Message,
 } from '../shared/messages';
+
+// Startup timing, readable in DevTools (performance.getEntriesByType('mark')).
+performance.mark('popup:script');
 
 const METER_FLOOR_DBFS = -60;
 
@@ -162,16 +166,38 @@ function modelLoaded(plan: CaptionPlan): void {
   render();
 }
 
+const GPU_INFO_KEY = 'gpuInfo';
+
+/**
+ * The adapter, asked for once per browser session: requestAdapter() takes 100 ms to over a second,
+ * and the popup would wait on it each time it opens. Only an adapter that was found is kept, so a
+ * GPU that failed once is tried again.
+ */
+async function sessionGpuInfo(): Promise<GpuInfo> {
+  const stored: unknown = (await chrome.storage.session.get(GPU_INFO_KEY))[GPU_INFO_KEY];
+  if (isGpuInfo(stored)) return stored;
+  const info = await gpuInfo();
+  if (info.available) await chrome.storage.session.set({ [GPU_INFO_KEY]: info });
+  return info;
+}
+
 /** Plans the caption backend here: the offscreen document runs on the same GPU. */
-async function refreshPlan(): Promise<void> {
-  const stored: unknown = (await chrome.storage.local.get(WEBGPU_FAILURE_KEY))[WEBGPU_FAILURE_KEY];
+async function currentPlan(): Promise<NonNullable<typeof planned>> {
+  const [gpu, stored] = await Promise.all([
+    sessionGpuInfo(),
+    chrome.storage.local.get(WEBGPU_FAILURE_KEY).then((items) => items[WEBGPU_FAILURE_KEY]),
+  ]);
   const plan = planBackend({
-    gpu: await gpuInfo(),
+    gpu,
     webgpuFailure: typeof stored === 'string' ? stored : null,
     crossOriginIsolated: self.crossOriginIsolated,
     hardwareConcurrency: navigator.hardwareConcurrency,
   });
-  planned = { plan, cached: await isCached(CAPTION_MODEL, plan.dtype) };
+  return { plan, cached: await isCached(CAPTION_MODEL, plan.dtype) };
+}
+
+async function refreshPlan(): Promise<void> {
+  planned = await currentPlan();
   render();
 }
 
@@ -232,12 +258,20 @@ chrome.storage.local.onChanged.addListener((changes) => {
 
 async function init(): Promise<void> {
   ui.version.textContent = `v${chrome.runtime.getManifest().version}`;
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  // The capture state shows first; the plan, which may wait on the GPU, follows.
+  const plan = currentPlan();
+  const [[tab], items] = await Promise.all([
+    chrome.tabs.query({ active: true, currentWindow: true }),
+    chrome.storage.session.get(STATE_KEY),
+  ]);
   activeTabId = tab?.id;
-  const stored: unknown = (await chrome.storage.session.get(STATE_KEY))[STATE_KEY];
+  const stored: unknown = items[STATE_KEY];
   state = isCaptureState(stored) ? stored : IDLE;
   render();
-  await refreshPlan();
+  performance.mark('popup:state');
+  planned = await plan;
+  render();
+  performance.mark('popup:plan');
 }
 
 void init();
