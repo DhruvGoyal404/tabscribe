@@ -25,7 +25,7 @@ import {
 } from '@huggingface/transformers';
 import ortWasmUrl from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url';
 import { GeneratedNoRepeatNGram, Interrupt, logProbability, TokenLogprobs } from './decoding';
-import { gpuInfo } from './gpu';
+import { gpuInfo, IGNORES_POWER_PREFERENCE } from './gpu';
 import { skipPaddingFrames, type WhisperFeatureExtractorLike } from './features';
 import {
   compressionRatio,
@@ -73,6 +73,11 @@ env.fetch = async (input, init) => {
 };
 const onnxWasm = env.backends.onnx.wasm;
 if (onnxWasm) onnxWasm.wasmPaths = { wasm: new URL(ortWasmUrl, self.location.href).href };
+// Transformers.js sets high-performance for ONNX Runtime's own requestAdapter(); see gpu.ts. Its
+// replacement, passing ORT a device of our own, would also take over the features ORT asks for.
+const onnxWebgpu = env.backends.onnx.webgpu;
+// eslint-disable-next-line @typescript-eslint/no-deprecated -- removing it, as above
+if (onnxWebgpu && IGNORES_POWER_PREFERENCE) delete onnxWebgpu.powerPreference;
 
 /** Whisper decodes in 30 s windows; language detection looks at the first one. */
 const WINDOW_SECONDS = 30;
